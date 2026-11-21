@@ -15,6 +15,12 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
+
+import os
+# This force-deletes the old broken database on every server start
+if os.path.exists("./rmg_database.db"):
+    os.remove("./rmg_database.db")
+    
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -282,10 +288,4 @@ def get_stats():
 
 import os
 
-@app.get("/api/reset-db")
-def reset_database():
-    if os.path.exists("./rmg_database.db"):
-        os.remove("./rmg_database.db")
-        Base.metadata.create_all(bind=engine)
-        return {"message": "Database cleared and recreated."}
-    return {"message": "No database found to clear."}
+
