@@ -104,9 +104,26 @@ class UserRegister(BaseModel):
     username: str
     password: str
 
+
+
+
+
+
 @app.get("/")
 def read_root():
     return {"message": "RMG API is running perfectly."}
+
+
+@app.post("/api/contact")
+def handle_contact(form: ContactForm):
+    db = SessionLocal()
+    try:
+        new_message = MessageDB(name=form.name, email=form.email, message=form.message)
+        db.add(new_message)
+        db.commit()
+        return {"status": "success", "message": "Message saved!"}
+    finally:
+        db.close()
 
 @app.post("/api/register")
 def register_user(user: UserRegister):
