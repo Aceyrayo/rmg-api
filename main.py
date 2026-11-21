@@ -1,13 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from typing import Optional
+import random
+
+# EMAIL IMPORTS
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
@@ -36,6 +40,9 @@ class UserDB(Base):
     phone = Column(String)
     company_name = Column(String)
     job_title = Column(String)
+    # NEW EMAIL VERIFICATION FIELDS
+    is_verified = Column(Boolean, default=False)
+    verification_code = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -75,14 +82,27 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# 4. SETUP API
+# 4. SETUP EMAIL CONFIG
+conf = ConnectionConfig(
+    MAIL_USERNAME = "rmgtechnologiesincgroup@gmail.com", 
+    MAIL_PASSWORD = "ecpe gkef wqok ezch", # NOT your normal password!
+    MAIL_FROM = "rmgtechnologiesincgroup@gmail.com",
+    MAIL_PORT = 587,
+    MAIL_SERVER = "smtp.gmail.com",
+    MAIL_STARTTLS = True,
+    MAIL_SSL_TLS = False,
+    USE_CREDENTIALS = True,
+    VALIDATE_CERTS = True
+)
+
+# 5. SETUP API
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:4321", 
         "http://127.0.0.1:4321",
-        "https://rmg-site.vercel.app" # <--- Add your exact Vercel URL here
+        "https://rmg-site.vercel.app" # <--- Your Vercel URL
     ], 
     allow_credentials=False,
     allow_methods=["*"],
@@ -104,15 +124,14 @@ class UserRegister(BaseModel):
     username: str
     password: str
 
+class VerifyEmail(BaseModel):
+    email: EmailStr
+    code: str
 
-
-
-
-
+# --- ROUTES ---
 @app.get("/")
 def read_root():
     return {"message": "RMG API is running perfectly."}
-
 
 @app.post("/api/contact")
 def handle_contact(form: ContactForm):
@@ -126,7 +145,7 @@ def handle_contact(form: ContactForm):
         db.close()
 
 @app.post("/api/register")
-def register_user(user: UserRegister):
+async def register_user(user: UserRegister):
     db = SessionLocal()
     try:
         if db.query(UserDB).filter(UserDB.username == user.username).first():
@@ -135,6 +154,10 @@ def register_user(user: UserRegister):
             raise HTTPException(status_code=400, detail="Email already registered")
         
         hashed_pw = get_password_hash(user.password)
+        
+        # GENERATE 6-DIGIT CODE
+        code = str(random.randint(100000, 999999))
+        
         new_user = UserDB(
             username=user.username, 
             hashed_password=hashed_pw, 
@@ -144,11 +167,54 @@ def register_user(user: UserRegister):
             email=user.email,
             phone=user.phone,
             company_name=user.company_name,
-            job_title=user.job_title
+            job_title=user.job_title,
+            is_verified=False,
+            verification_code=code
         )
         db.add(new_user)
         db.commit()
-        return {"message": "User registered successfully"}
+
+        # SEND THE EMAIL
+        html = f"""
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+            <h2 style="color: #0f172a;">Welcome to RMG Technologies</h2>
+            <p>Hello {user.first_name},</p>
+            <p>Thank you for signing up. To activate your enterprise account, please use the following 6-digit security code:</p>
+            <h1 style="background: #f1f5f9; padding: 15px; border-radius: 8px; text-align: center; letter-spacing: 5px; color: #2563eb;">{code}</h1>
+            <p>If you did not request this, please ignore this email.</p>
+        </div>
+        """
+        message = MessageSchema(
+            subject="Your RMG Security Code",
+            recipients=[user.email],
+            body=html,
+            subtype=MessageType.html
+        )
+        
+        fm = FastMail(conf)
+        await fm.send_message(message)
+
+        return {"message": "User registered. Please check your email for the verification code."}
+    finally:
+        db.close()
+
+@app.post("/api/verify-email")
+def verify_email(data: VerifyEmail):
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.email == data.email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user.is_verified:
+            return {"message": "Account already verified. You can log in."}
+        
+        if user.verification_code != data.code:
+            raise HTTPException(status_code=400, detail="Invalid verification code")
+        
+        user.is_verified = True
+        user.verification_code = None
+        db.commit()
+        return {"message": "Account verified successfully!"}
     finally:
         db.close()
 
@@ -159,6 +225,11 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
         if not user or not verify_password(form_data.password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect username or password")
+        
+        # CHECK IF VERIFIED
+        if not user.is_verified:
+            raise HTTPException(status_code=403, detail="Please verify your email address before logging in.")
+        
         access_token = create_access_token(data={"sub": user.username, "role": user.role})
         return {"access_token": access_token, "token_type": "bearer", "role": user.role, "first_name": user.first_name}
     finally:
@@ -185,7 +256,8 @@ def setup_admin():
             username="admin", hashed_password=hashed_pw, role="admin",
             first_name="System", last_name="Admin", 
             email="admin@rmgtechnologies.com", phone="+1 555 000 0000",
-            company_name="RMG", job_title="Administrator"
+            company_name="RMG", job_title="Administrator",
+            is_verified=True # ADMIN BYPASSES VERIFICATION
         )
         db.add(new_admin)
         db.commit()
@@ -193,21 +265,30 @@ def setup_admin():
     finally:
         db.close()
 
-
-        # --- PUBLIC STATS ROUTE ---
+# --- PUBLIC STATS ROUTE ---
 @app.get("/api/stats")
 def get_stats():
     db = SessionLocal()
     try:
-        # Count the total number of users in the database
         user_count = db.query(UserDB).count()
-        
-        # Since we don't have real trading volume yet, we'll return the real user count
-        # and some fixed infrastructure stats.
         return {
-            "global_users": user_count , # +15000 to represent your current real users
+            "global_users": user_count,
             "uptime": "99.99%",
             "latency": "< 10ms"
         }
     finally:
         db.close()
+
+
+import os
+
+@app.get("/api/reset-db")
+def reset_database():
+    # THIS IS A DANGEROUS ROUTE (Only use for testing)
+    db_path = "./rmg_database.db"
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        # Recreate tables
+        Base.metadata.create_all(bind=engine)
+        return {"message": "Database cleared and recreated."}
+    return {"message": "No database found to clear."}
