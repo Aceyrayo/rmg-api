@@ -84,8 +84,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# 4. SETUP EMAIL (Resend API - Bypasses Render SMTP block)
-import os
+# 4. SETUP EMAIL (Resend API)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 async def send_verification_email(email: str, code: str, name: str):
@@ -177,8 +176,6 @@ async def register_user(user: UserRegister):
             raise HTTPException(status_code=400, detail="Email already registered")
         
         hashed_pw = get_password_hash(user.password)
-        
-        # GENERATE 6-DIGIT CODE
         code = str(random.randint(100000, 999999))
         
         new_user = UserDB(
@@ -197,7 +194,6 @@ async def register_user(user: UserRegister):
         db.add(new_user)
         db.commit()
 
-        # SEND THE EMAIL VIA HTTP (NOT SMTP)
         await send_verification_email(user.email, code, user.first_name)
 
         return {"message": "User registered. Please check your email for the verification code."}
@@ -236,9 +232,77 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
             raise HTTPException(status_code=403, detail="Please verify your email address before logging in.")
         
         access_token = create_access_token(data={"sub": user.username, "role": user.role})
-        return {"access_token": access_token, "token_type": "bearer", "role": user.role, "first_name": user.first_name}
+        
+        # FIXED: Added email to the return statement
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer", 
+            "role": user.role, 
+            "first_name": user.first_name,
+            "email": user.email 
+        }
     finally:
         db.close()
+
+# NEW ROUTE: Get User Profile Data
+@app.get("/api/profile")
+def get_profile(current_user: UserDB = Depends(get_current_user)):
+    return {
+        "first_name": current_user.first_name,
+        "last_name": current_user.last_name,
+        "email": current_user.email,
+        "phone": current_user.phone,
+        "company_name": current_user.company_name,
+        "job_title": current_user.job_title
+    }
+class ProfileUpdate(BaseModel):
+    first_name: str
+    last_name: str
+    phone: str
+    company_name: str
+    job_title: str
+
+@app.put("/api/profile")
+def update_profile(profile: ProfileUpdate, current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.id == current_user.id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user.first_name = profile.first_name
+        user.last_name = profile.last_name
+        user.phone = profile.phone
+        user.company_name = profile.company_name
+        user.job_title = profile.job_title
+        
+        db.commit()
+        db.refresh(user)
+        
+        return {"message": "Profile updated successfully!"}
+    finally:
+        db.close()
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+@app.delete("/api/profile")
+def delete_profile(data: DeleteAccountRequest, current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.id == current_user.id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        # Verify password before deleting
+        if not verify_password(data.password, user.hashed_password):
+            raise HTTPException(status_code=400, detail="Incorrect password. Account not deleted.")
+            
+        db.delete(user)
+        db.commit()
+        return {"message": "Account deleted successfully"}
+    finally:
+        db.close()
+
 
 @app.get("/api/messages")
 def get_all_messages(current_user: UserDB = Depends(get_current_user)):
@@ -262,21 +326,13 @@ def setup_admin():
             first_name="System", last_name="Admin", 
             email="admin@rmgtechnologies.com", phone="+1 555 000 0000",
             company_name="RMG", job_title="Administrator",
-            is_verified=True # ADMIN BYPASSES VERIFICATION
+            is_verified=True
         )
         db.add(new_admin)
         db.commit()
         return {"message": "Admin created!"}
     finally:
         db.close()
-
-@app.get("/api/reset-db")
-def reset_database():
-    if os.path.exists("./rmg_database.db"):
-        os.remove("./rmg_database.db")
-        Base.metadata.create_all(bind=engine)
-        return {"message": "Database cleared and recreated."}
-    return {"message": "No database found to clear."}
 
 @app.get("/api/stats")
 def get_stats():
