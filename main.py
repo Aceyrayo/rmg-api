@@ -280,15 +280,3 @@ def get_stats():
         db.close()
 
 
-import os
-
-@app.get("/api/reset-db")
-def reset_database():
-    # THIS IS A DANGEROUS ROUTE (Only use for testing)
-    db_path = "./rmg_database.db"
-    if os.path.exists(db_path):
-        os.remove(db_path)
-        # Recreate tables
-        Base.metadata.create_all(bind=engine)
-        return {"message": "Database cleared and recreated."}
-    return {"message": "No database found to clear."}
