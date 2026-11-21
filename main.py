@@ -79,7 +79,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:4321", 
+        "http://127.0.0.1:4321",
+        "https://rmg-site.vercel.app" # <--- Add your exact Vercel URL here
+    ], 
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
