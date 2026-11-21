@@ -280,3 +280,12 @@ def get_stats():
         db.close()
 
 
+import os
+
+@app.get("/api/reset-db")
+def reset_database():
+    if os.path.exists("./rmg_database.db"):
+        os.remove("./rmg_database.db")
+        Base.metadata.create_all(bind=engine)
+        return {"message": "Database cleared and recreated."}
+    return {"message": "No database found to clear."}
