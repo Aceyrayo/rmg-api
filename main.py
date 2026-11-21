@@ -9,15 +9,13 @@ from datetime import datetime, timedelta
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from typing import Optional
 import random
-
-# EMAIL IMPORTS
-from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
+import os
+import httpx
 
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
 
-import os
-# This force-deletes the old broken database on every server start
+# Force-deletes the old broken database on every server start (for testing)
 if os.path.exists("./rmg_database.db"):
     os.remove("./rmg_database.db")
     
@@ -39,14 +37,12 @@ class UserDB(Base):
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     role = Column(String, default="client")
-    # ENTERPRISE FIELDS
     first_name = Column(String)
     last_name = Column(String)
     email = Column(String, unique=True, index=True)
     phone = Column(String)
     company_name = Column(String)
     job_title = Column(String)
-    # NEW EMAIL VERIFICATION FIELDS
     is_verified = Column(Boolean, default=False)
     verification_code = Column(String, nullable=True)
 
@@ -88,18 +84,39 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# 4. SETUP EMAIL CONFIG
-conf = ConnectionConfig(
-    MAIL_USERNAME = "rmgtechnologiesincgroup@gmail.com", 
-    MAIL_PASSWORD = "ecpe gkef wqok ezch", # NOT your normal password!
-    MAIL_FROM = "rmgtechnologiesincgroup@gmail.com",
-    MAIL_PORT = 587,
-    MAIL_SERVER = "smtp.gmail.com",
-    MAIL_STARTTLS = True,
-    MAIL_SSL_TLS = False,
-    USE_CREDENTIALS = True,
-    VALIDATE_CERTS = True
-)
+# 4. SETUP EMAIL (Resend API - Bypasses Render SMTP block)
+import os
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+
+async def send_verification_email(email: str, code: str, name: str):
+    html_content = f"""
+    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+        <h2 style="color: #0f172a;">Welcome to RMG Technologies</h2>
+        <p>Hello {name},</p>
+        <p>Thank you for signing up. To activate your enterprise account, please use the following 6-digit security code:</p>
+        <h1 style="background: #f1f5f9; padding: 15px; border-radius: 8px; text-align: center; letter-spacing: 5px; color: #2563eb;">{code}</h1>
+        <p>If you did not request this, please ignore this email.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": "RMG Technologies <onboarding@resend.dev>",
+                "to": [email],
+                "subject": "Your RMG Security Code",
+                "html": html_content
+            }
+        )
+        
+        if response.status_code != 200:
+            print(f"Failed to send email: {response.text}")
+            raise HTTPException(status_code=500, detail="Failed to send verification email")
 
 # 5. SETUP API
 app = FastAPI()
@@ -108,7 +125,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:4321", 
         "http://127.0.0.1:4321",
-        "https://rmg-site.vercel.app" # <--- Your Vercel URL
+        "https://rmg-site.vercel.app" # <--- Ensure this matches your Vercel URL
     ], 
     allow_credentials=False,
     allow_methods=["*"],
@@ -180,25 +197,8 @@ async def register_user(user: UserRegister):
         db.add(new_user)
         db.commit()
 
-        # SEND THE EMAIL
-        html = f"""
-        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
-            <h2 style="color: #0f172a;">Welcome to RMG Technologies</h2>
-            <p>Hello {user.first_name},</p>
-            <p>Thank you for signing up. To activate your enterprise account, please use the following 6-digit security code:</p>
-            <h1 style="background: #f1f5f9; padding: 15px; border-radius: 8px; text-align: center; letter-spacing: 5px; color: #2563eb;">{code}</h1>
-            <p>If you did not request this, please ignore this email.</p>
-        </div>
-        """
-        message = MessageSchema(
-            subject="Your RMG Security Code",
-            recipients=[user.email],
-            body=html,
-            subtype=MessageType.html
-        )
-        
-        fm = FastMail(conf)
-        await fm.send_message(message)
+        # SEND THE EMAIL VIA HTTP (NOT SMTP)
+        await send_verification_email(user.email, code, user.first_name)
 
         return {"message": "User registered. Please check your email for the verification code."}
     finally:
@@ -232,7 +232,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         if not user or not verify_password(form_data.password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect username or password")
         
-        # CHECK IF VERIFIED
         if not user.is_verified:
             raise HTTPException(status_code=403, detail="Please verify your email address before logging in.")
         
@@ -271,7 +270,6 @@ def setup_admin():
     finally:
         db.close()
 
-# --- PUBLIC STATS ROUTE ---
 @app.get("/api/stats")
 def get_stats():
     db = SessionLocal()
@@ -284,8 +282,3 @@ def get_stats():
         }
     finally:
         db.close()
-
-
-import os
-
-
