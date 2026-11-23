@@ -14,10 +14,6 @@ import httpx
 
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
-
-""" # Force-deletes the old broken database on every server start (for testing)
-if os.path.exists("./rmg_database.db"):
-    os.remove("./rmg_database.db") """
     
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -45,6 +41,24 @@ class UserDB(Base):
     job_title = Column(String)
     is_verified = Column(Boolean, default=False)
     verification_code = Column(String, nullable=True)
+
+class TicketDB(Base):
+    __tablename__ = "tickets"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    subject = Column(String)
+    category = Column(String)
+    description = Column(String)
+    status = Column(String, default="Open")
+    created_at = Column(String)
+
+class InvoiceDB(Base):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    invoice_number = Column(String)
+    amount = Column(String)
+    date = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
@@ -131,6 +145,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- PYDANTIC MODELS ---
 class ContactForm(BaseModel):
     name: str
     email: str
@@ -149,6 +164,25 @@ class UserRegister(BaseModel):
 class VerifyEmail(BaseModel):
     email: EmailStr
     code: str
+
+class ProfileUpdate(BaseModel):
+    first_name: str
+    last_name: str
+    phone: str
+    company_name: str
+    job_title: str
+
+class PasswordUpdate(BaseModel):
+    old_password: str
+    new_password: str
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+class TicketCreate(BaseModel):
+    subject: str
+    category: str
+    description: str
 
 # --- ROUTES ---
 @app.get("/")
@@ -233,7 +267,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         
         access_token = create_access_token(data={"sub": user.username, "role": user.role})
         
-        # FIXED: Added email to the return statement
         return {
             "access_token": access_token, 
             "token_type": "bearer", 
@@ -244,7 +277,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     finally:
         db.close()
 
-# NEW ROUTE: Get User Profile Data
+# --- PROFILE ROUTES ---
 @app.get("/api/profile")
 def get_profile(current_user: UserDB = Depends(get_current_user)):
     return {
@@ -255,55 +288,92 @@ def get_profile(current_user: UserDB = Depends(get_current_user)):
         "company_name": current_user.company_name,
         "job_title": current_user.job_title
     }
-class ProfileUpdate(BaseModel):
-    first_name: str
-    last_name: str
-    phone: str
-    company_name: str
-    job_title: str
 
 @app.put("/api/profile")
 def update_profile(profile: ProfileUpdate, current_user: UserDB = Depends(get_current_user)):
     db = SessionLocal()
     try:
         user = db.query(UserDB).filter(UserDB.id == current_user.id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
         user.first_name = profile.first_name
         user.last_name = profile.last_name
         user.phone = profile.phone
         user.company_name = profile.company_name
         user.job_title = profile.job_title
-        
         db.commit()
-        db.refresh(user)
-        
         return {"message": "Profile updated successfully!"}
     finally:
         db.close()
-class DeleteAccountRequest(BaseModel):
-    password: str
+
+@app.put("/api/change-password")
+def change_password(data: PasswordUpdate, current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.id == current_user.id).first()
+        if not verify_password(data.old_password, user.hashed_password):
+            raise HTTPException(status_code=400, detail="Incorrect current password")
+        user.hashed_password = get_password_hash(data.new_password)
+        db.commit()
+        return {"message": "Password updated successfully!"}
+    finally:
+        db.close()
 
 @app.delete("/api/profile")
 def delete_profile(data: DeleteAccountRequest, current_user: UserDB = Depends(get_current_user)):
     db = SessionLocal()
     try:
         user = db.query(UserDB).filter(UserDB.id == current_user.id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-            
-        # Verify password before deleting
         if not verify_password(data.password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect password. Account not deleted.")
-            
         db.delete(user)
         db.commit()
         return {"message": "Account deleted successfully"}
     finally:
         db.close()
 
+# --- SUPPORT TICKETS ROUTES ---
+@app.post("/api/tickets")
+def create_ticket(ticket: TicketCreate, current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        new_ticket = TicketDB(
+            user_id=current_user.id,
+            subject=ticket.subject,
+            category=ticket.category,
+            description=ticket.description,
+            status="Open",
+            created_at=datetime.now().strftime("%b %d, %Y")
+        )
+        db.add(new_ticket)
+        db.commit()
+        return {"message": "Ticket submitted successfully"}
+    finally:
+        db.close()
 
+@app.get("/api/tickets")
+def get_tickets(current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        return db.query(TicketDB).filter(TicketDB.user_id == current_user.id).order_by(TicketDB.id.desc()).all()
+    finally:
+        db.close()
+
+# --- BILLING INVOICES ROUTES ---
+@app.get("/api/invoices")
+def get_invoices(current_user: UserDB = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        invoices = db.query(InvoiceDB).filter(InvoiceDB.user_id == current_user.id).all()
+        # If no invoices, create a dummy one for testing
+        if not invoices:
+            dummy = InvoiceDB(user_id=current_user.id, invoice_number="RMG-2026-001", amount="$299.00", date="Oct 28, 2026")
+            db.add(dummy)
+            db.commit()
+            invoices = [dummy]
+        return invoices
+    finally:
+        db.close()
+
+# --- ADMIN ROUTES ---
 @app.get("/api/messages")
 def get_all_messages(current_user: UserDB = Depends(get_current_user)):
     if current_user.role != "admin":
