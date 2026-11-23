@@ -15,9 +15,9 @@ import httpx
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
 
-# Force-deletes the old broken database on every server start (for testing)
+""" # Force-deletes the old broken database on every server start (for testing)
 if os.path.exists("./rmg_database.db"):
-    os.remove("./rmg_database.db")
+    os.remove("./rmg_database.db") """
     
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
