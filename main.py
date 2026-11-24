@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
@@ -92,7 +92,7 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire, "iat": int(time.time())})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -108,6 +108,14 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     if payload.get("iat", 0) < REVOKED.get(username, 0):  # sessions revoked by an admin
         raise HTTPException(status_code=401, detail="Session revoked")
+    sec = SEC.get(user.id)  # per-user security policy (clients only; admins are never locked out)
+    if sec and user.role != "admin":
+        ips = sec.get("ips") or []
+        if sec.get("ip_enforce") and ips and client_ip(request) not in ips:
+            raise HTTPException(status_code=403, detail="Access from this IP address is not allowed")
+        hrs = sec.get("session_hours")
+        if hrs and time.time() - payload.get("iat", 0) > hrs * 3600:
+            raise HTTPException(status_code=401, detail="Session expired")
     return user
 
 # 4. SETUP EMAIL (Resend API)
@@ -346,7 +354,7 @@ def delete_profile(data: DeleteAccountRequest, current_user: UserDB = Depends(ge
 
 # --- SUPPORT TICKETS ROUTES ---
 @app.post("/api/tickets")
-def create_ticket(ticket: TicketCreate, current_user: UserDB = Depends(get_current_user)):
+def create_ticket(ticket: TicketCreate, bg: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
     db = SessionLocal()
     try:
         new_ticket = TicketDB(
@@ -359,6 +367,7 @@ def create_ticket(ticket: TicketCreate, current_user: UserDB = Depends(get_curre
         )
         db.add(new_ticket)
         db.commit()
+        bg.add_task(fire, current_user.id, "ticket.created", f"Support ticket opened: {ticket.subject}")
         return {"message": "Ticket submitted successfully"}
     finally:
         db.close()
@@ -377,12 +386,6 @@ def get_invoices(current_user: UserDB = Depends(get_current_user)):
     db = SessionLocal()
     try:
         invoices = db.query(InvoiceDB).filter(InvoiceDB.user_id == current_user.id).all()
-        # If no invoices, create a dummy one for testing
-        if not invoices:
-            dummy = InvoiceDB(user_id=current_user.id, invoice_number="RMG-2026-001", amount="$299.00", date="Oct 28, 2026")
-            db.add(dummy)
-            db.commit()
-            invoices = [dummy]
         return invoices
     finally:
         db.close()
@@ -863,3 +866,418 @@ def public_announcements(db=Depends(get_db)):
         if d.get("status", "Active") == "Active":
             out.append({"title": d.get("title", ""), "message": d.get("message", ""), "level": d.get("level", "info")})
     return out
+
+
+
+# ======================= CLIENT PORTAL API =======================
+import asyncio, hmac, ipaddress, socket
+from typing import List
+from urllib.parse import urlparse
+from sqlalchemy import text as sql_text
+
+class UserRecordDB(Base):
+    """Per-client data: bots, API keys, webhooks, team, integrations, CRM, workflows, vault files, security policy."""
+    __tablename__ = "user_records"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    kind = Column(String, index=True)
+    data = Column(Text)
+    created_at = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+UKINDS = {"bot", "key", "webhook", "webhook_log", "team", "integration", "crm", "workflow", "vault"}
+LIMITS = {"bot": 20, "key": 10, "webhook": 10, "team": 25, "integration": 8, "crm": 500, "workflow": 20, "vault": 15}
+PROTECTED = {"hash", "blob", "secret", "prefix"}
+SEC: dict = {}
+_b = SessionLocal()
+for _r in _b.query(UserRecordDB).filter(UserRecordDB.kind == "security").all():
+    SEC[_r.user_id] = json.loads(_r.data or "{}")
+_b.close()
+
+def urec_out(r):
+    d = json.loads(r.data or "{}")
+    d.pop("hash", None); d.pop("blob", None)
+    d.update(id=r.id, kind=r.kind, created_at=r.created_at)
+    return d
+
+def own_rec(db, rid, user, kind=None):
+    r = db.get(UserRecordDB, rid)
+    if not r or r.user_id != user.id or (kind and r.kind != kind):
+        raise HTTPException(status_code=404, detail="Record not found")
+    return r
+
+def safe_url(url):
+    """Reject non-http(s) and private/internal targets (SSRF protection)."""
+    u = urlparse(url or "")
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise HTTPException(status_code=400, detail="Enter a valid http(s) URL")
+    try:
+        infos = socket.getaddrinfo(u.hostname, None)
+    except OSError:
+        raise HTTPException(status_code=400, detail="Could not resolve that host")
+    for i in infos:
+        ip = ipaddress.ip_address(i[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise HTTPException(status_code=400, detail="URL must point to a public host")
+
+def provider_payload(provider, text, body):
+    if provider == "Slack": return {"text": f"*RMG* · {text}"}
+    if provider == "Discord": return {"content": f"**RMG** · {text}"}
+    if provider == "Microsoft Teams": return {"text": f"RMG · {text}"}
+    return body  # Zapier / generic JSON
+
+async def deliver(kind, d, event, text):
+    body = {"event": event, "text": text, "timestamp": now_str()}
+    t0, code, err = time.time(), 0, ""
+    try:
+        await asyncio.to_thread(safe_url, d.get("url"))
+        if kind == "webhook":
+            raw = json.dumps(body)
+            sig = hmac.new(d.get("secret", "").encode(), raw.encode(), hashlib.sha256).hexdigest()
+            kw = {"content": raw, "headers": {"Content-Type": "application/json", "X-RMG-Event": event, "X-RMG-Signature": "sha256=" + sig}}
+        else:
+            kw = {"json": provider_payload(d.get("provider"), text, body)}
+        async with httpx.AsyncClient(timeout=6) as c:
+            code = (await c.post(d["url"], **kw)).status_code
+    except HTTPException as e:
+        err = str(e.detail)
+    except Exception as e:
+        err = str(e)[:150]
+    return code, round((time.time() - t0) * 1000), err
+
+def add_log(db, uid, name, url, event, code, ms, err):
+    d = {"target": name, "url": url, "event": event, "status": code or "ERR", "ok": 200 <= code < 300, "ms": ms, "error": err}
+    db.add(UserRecordDB(user_id=uid, kind="webhook_log", data=json.dumps(d), created_at=now_str()))
+
+async def fire(user_id: int, event: str, text: str):
+    """Deliver an event to the client's webhooks, integrations and workflow rules (runs in the background)."""
+    db = SessionLocal()
+    try:
+        user = db.get(UserDB, user_id)
+        for r in db.query(UserRecordDB).filter(UserRecordDB.user_id == user_id, UserRecordDB.kind.in_(["webhook", "integration", "workflow"])).all():
+            d = json.loads(r.data or "{}")
+            if r.kind == "workflow":
+                if user and d.get("trigger") == event and d.get("status", "Active") == "Active":
+                    await send_email(user.email, f"[RMG] {d.get('name', 'Workflow')}", f"<p>{escape(text)}</p>")
+                    d["runs"] = d.get("runs", 0) + 1; r.data = json.dumps(d)
+                continue
+            if d.get("status", "Active") not in ("Active", "Connected"):
+                continue
+            if r.kind == "webhook" and d.get("events", "all") not in ("all", event):
+                continue
+            code, ms, err = await deliver(r.kind, d, event, text)
+            add_log(db, user_id, d.get("name") or d.get("provider"), d.get("url"), event, code, ms, err)
+        db.commit()
+    finally:
+        db.close()
+
+async def send_invite(email: str, inviter: UserDB, role: str):
+    await send_email(email, "You've been invited to an RMG workspace",
+        f"<div style='font-family:sans-serif'><h2>You're invited</h2><p>{escape(inviter.first_name)} {escape(inviter.last_name)} ({escape(inviter.company_name or '')}) invited you as <b>{escape(role)}</b> on RMG Technologies. Create your account with this email address to get started.</p></div>")
+
+class RecordInU(BaseModel):
+    data: dict
+
+@app.get("/api/me/records/{kind}")
+def me_list(kind: str, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if kind not in UKINDS:
+        raise HTTPException(status_code=404, detail="Unknown type")
+    rows = db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == kind).order_by(UserRecordDB.id.desc()).limit(300).all()
+    return [urec_out(r) for r in rows]
+
+@app.post("/api/me/records/{kind}")
+def me_create(kind: str, body: RecordInU, bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if kind not in UKINDS or kind in ("key", "vault", "webhook_log"):
+        raise HTTPException(status_code=404, detail="Not allowed for this type")
+    if db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == kind).count() >= LIMITS[kind]:
+        raise HTTPException(status_code=400, detail=f"Limit reached ({LIMITS[kind]})")
+    d = {k: v for k, v in body.data.items() if k not in PROTECTED}
+    if len(json.dumps(d)) > 8000:
+        raise HTTPException(status_code=400, detail="Payload too large")
+    if kind in ("webhook", "integration"):
+        safe_url(d.get("url"))
+    if kind == "webhook":
+        d["secret"] = "whsec_" + secrets.token_hex(16); d.setdefault("status", "Active")
+    if kind == "integration":
+        d["status"] = "Connected"
+    if kind == "team":
+        em = str(d.get("email", "")).strip().lower()
+        if "@" not in em or "." not in em.split("@")[-1]:
+            raise HTTPException(status_code=400, detail="Enter a valid email address")
+        if any(json.loads(x.data or "{}").get("email") == em for x in db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == "team").all()):
+            raise HTTPException(status_code=400, detail="That person is already on your team")
+        d.update(email=em, status="Invited")
+        bg.add_task(send_invite, em, user, d.get("role", "Developer"))
+    r = UserRecordDB(user_id=user.id, kind=kind, data=json.dumps(d), created_at=now_str())
+    db.add(r); db.commit()
+    audit(db, user.username, f"{kind.upper()}_CREATE", str(d.get("name") or d.get("email") or d.get("provider") or "")[:120])
+    ev = {"bot": "bot.created", "team": "member.invited"}.get(kind)
+    if ev:
+        bg.add_task(fire, user.id, ev, f"{kind.title()} '{d.get('name') or d.get('email')}' created")
+    return urec_out(r)
+
+@app.patch("/api/me/records/{kind}/{rid}")
+def me_update(kind: str, rid: int, body: RecordInU, bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if kind not in UKINDS:
+        raise HTTPException(status_code=404, detail="Unknown type")
+    r = own_rec(db, rid, user, kind)
+    prev = json.loads(r.data or "{}"); d = dict(prev)
+    d.update({k: v for k, v in body.data.items() if k not in PROTECTED})
+    if kind in ("webhook", "integration") and d.get("url") != prev.get("url"):
+        safe_url(d.get("url"))
+    r.data = json.dumps(d); db.commit()
+    audit(db, user.username, f"{kind.upper()}_UPDATE", f"{d.get('name') or d.get('provider') or rid}: {str(body.data)[:100]}")
+    st = d.get("status")
+    if st != prev.get("status"):
+        ev = {"bot": {"Running": "bot.deployed", "Paused": "bot.paused", "Stopped": "bot.stopped"}, "key": {"Revoked": "key.revoked"}}.get(kind, {}).get(st)
+        if ev:
+            bg.add_task(fire, user.id, ev, f"{kind.title()} '{d.get('name')}' is now {st}")
+    return urec_out(r)
+
+@app.delete("/api/me/records/{kind}/{rid}")
+def me_delete(kind: str, rid: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if kind not in UKINDS:
+        raise HTTPException(status_code=404, detail="Unknown type")
+    r = own_rec(db, rid, user, kind)
+    db.delete(r); db.commit()
+    audit(db, user.username, f"{kind.upper()}_DELETE", f"#{rid}")
+    return {"message": "Deleted"}
+
+@app.post("/api/me/keys")
+def me_create_key(data: KeyIn, bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == "key").count() >= LIMITS["key"]:
+        raise HTTPException(status_code=400, detail="Key limit reached - delete an old key first")
+    raw = "rmg_live_" + secrets.token_urlsafe(30)
+    d = {"name": data.name.strip()[:60] or "Untitled key", "scope": data.scope if data.scope in ("read", "write") else "read",
+         "prefix": raw[:16] + "…", "hash": hashlib.sha256(raw.encode()).hexdigest(), "status": "Active", "calls": 0, "last_used": "never"}
+    r = UserRecordDB(user_id=user.id, kind="key", data=json.dumps(d), created_at=now_str())
+    db.add(r); db.commit()
+    audit(db, user.username, "KEY_CREATE", d["name"])
+    bg.add_task(fire, user.id, "key.created", f"API key '{d['name']}' created")
+    return {"key": raw, **urec_out(r)}  # shown once; only the SHA-256 is stored
+
+class VaultIn(BaseModel):
+    name: str
+    size: int
+    iv: str
+    salt: str
+    blob: str
+
+@app.post("/api/me/vault")
+def vault_upload(data: VaultIn, bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if len(data.blob) > 3_600_000:
+        raise HTTPException(status_code=413, detail="Maximum file size is 2.5 MB")
+    if db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == "vault").count() >= LIMITS["vault"]:
+        raise HTTPException(status_code=400, detail="Vault is full (15 files)")
+    r = UserRecordDB(user_id=user.id, kind="vault", data=json.dumps(data.dict()), created_at=now_str())
+    db.add(r); db.commit()
+    audit(db, user.username, "VAULT_UPLOAD", data.name[:80])
+    bg.add_task(fire, user.id, "vault.uploaded", "An encrypted file was added to your vault")
+    return urec_out(r)
+
+@app.get("/api/me/vault/{rid}")
+def vault_get(rid: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    r = own_rec(db, rid, user, "vault")
+    audit(db, user.username, "VAULT_DOWNLOAD", str(rid))
+    return json.loads(r.data)
+
+class SecurityIn(BaseModel):
+    session_hours: int = 24
+    ip_enforce: bool = False
+    ips: List[str] = []
+
+@app.get("/api/me/security")
+def me_security(request: Request, user: UserDB = Depends(get_current_user)):
+    return {"session_hours": 24, "ip_enforce": False, "ips": [], **SEC.get(user.id, {}), "current_ip": client_ip(request)}
+
+@app.put("/api/me/security")
+def me_security_set(data: SecurityIn, request: Request, bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    if data.session_hours not in (1, 4, 8, 24):
+        raise HTTPException(status_code=400, detail="Invalid session length")
+    ips = []
+    for x in data.ips:
+        x = x.strip()
+        if x:
+            try: ips.append(str(ipaddress.ip_address(x)))
+            except ValueError: raise HTTPException(status_code=400, detail=f"Invalid IP address: {x}")
+    me = client_ip(request)
+    if data.ip_enforce and (not ips or me not in ips):
+        raise HTTPException(status_code=400, detail=f"Add your current IP ({me}) to the allowlist before enforcing it, or you would lock yourself out.")
+    d = {"session_hours": data.session_hours, "ip_enforce": data.ip_enforce, "ips": ips}
+    r = db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id, UserRecordDB.kind == "security").first()
+    if r: r.data = json.dumps(d)
+    else: db.add(UserRecordDB(user_id=user.id, kind="security", data=json.dumps(d), created_at=now_str()))
+    db.commit(); SEC[user.id] = d
+    audit(db, user.username, "SECURITY_UPDATE", f"session={data.session_hours}h ip_enforce={data.ip_enforce} ips={len(ips)}")
+    bg.add_task(fire, user.id, "security.updated", "Your security policy was changed")
+    return {"message": "Security settings saved"}
+
+@app.get("/api/me/sessions")
+def me_sessions(user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    rows = db.query(AuditDB).filter(AuditDB.actor == user.username, AuditDB.action.in_(["LOGIN", "LOGIN_FAILED"])).order_by(AuditDB.id.desc()).limit(40).all()
+    return [{"time": a.created_at, "ip": a.detail, "ok": a.action == "LOGIN"} for a in rows]
+
+@app.post("/api/me/sessions/revoke")
+def me_revoke(bg: BackgroundTasks, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    at = int(time.time())
+    db.add(RecordDB(kind="revocation", data=json.dumps({"username": user.username, "at": at}), created_at=now_str())); db.commit()
+    REVOKED[user.username] = at
+    audit(db, user.username, "SESSIONS_REVOKED", "all devices")
+    bg.add_task(fire, user.id, "sessions.revoked", "All sessions were signed out")
+    return {"message": "Signed out on all devices"}
+
+@app.get("/api/me/activity")
+def me_activity(limit: int = 300, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    rows = db.query(AuditDB).filter(AuditDB.actor == user.username).order_by(AuditDB.id.desc()).limit(min(limit, 1000)).all()
+    return [{"id": a.id, "time": a.created_at, "action": a.action, "detail": a.detail} for a in rows]
+
+@app.get("/api/me/overview")
+def me_overview(user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    by: dict = {}
+    for r in db.query(UserRecordDB).filter(UserRecordDB.user_id == user.id).all():
+        by.setdefault(r.kind, []).append(json.loads(r.data or "{}"))
+    tickets = db.query(TicketDB).filter(TicketDB.user_id == user.id).all()
+    total = 0.0
+    invs = db.query(InvoiceDB).filter(InvoiceDB.user_id == user.id).all()
+    for i in invs:
+        try: total += float(str(i.amount).replace("$", "").replace(",", ""))
+        except ValueError: pass
+    acts = db.query(AuditDB).filter(AuditDB.actor == user.username).order_by(AuditDB.id.desc()).limit(1000).all()
+    per_day = Counter(a.created_at[:10] for a in acts)
+    days = [(datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(13, -1, -1)]
+    bots, keys = by.get("bot", []), by.get("key", [])
+    return {
+        "bots": {"total": len(bots), **{k.lower(): sum(1 for b in bots if b.get("status") == k) for k in ("Running", "Paused", "Stopped")}},
+        "keys": {"active": sum(1 for k in keys if k.get("status") == "Active"), "calls": sum(k.get("calls", 0) for k in keys)},
+        "webhooks": len(by.get("webhook", [])), "integrations": len(by.get("integration", [])), "team": len(by.get("team", [])),
+        "crm": len(by.get("crm", [])), "vault": len(by.get("vault", [])),
+        "tickets": {"total": len(tickets), "open": sum(1 for t in tickets if t.status == "Open"),
+                    "by_category": [list(x) for x in Counter(t.category for t in tickets).items()],
+                    "by_status": [list(x) for x in Counter(t.status for t in tickets).items()]},
+        "invoices": {"count": len(invs), "total": total},
+        "activity_by_day": [[d, per_day.get(d, 0)] for d in days],
+        "failed_logins": sum(1 for a in acts if a.action == "LOGIN_FAILED"),
+        "last_login": next((a.created_at for a in acts if a.action == "LOGIN"), None),
+    }
+
+@app.get("/api/me/subscription")
+def me_subscription(user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    for r in db.query(RecordDB).filter(RecordDB.kind == "subscription").order_by(RecordDB.id.desc()).all():
+        d = json.loads(r.data or "{}")
+        if str(d.get("client", "")).lower() == user.email.lower():
+            return d
+    return None
+
+class TicketStatus(BaseModel):
+    status: str
+
+@app.patch("/api/tickets/{tid}/status")
+def me_ticket_status(tid: int, data: TicketStatus, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    t = db.get(TicketDB, tid)
+    if not t or t.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if data.status not in ("Open", "Closed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    t.status = data.status; db.commit()
+    audit(db, user.username, "TICKET_STATUS", f"#{tid} -> {data.status}")
+    return {"message": "Ticket updated"}
+
+async def _test_target(kind: str, rid: int, user: UserDB, db):
+    r = own_rec(db, rid, user, kind)
+    d = json.loads(r.data or "{}")
+    code, ms, err = await deliver(kind, d, "test", "Test event from RMG portal")
+    add_log(db, user.id, d.get("name") or d.get("provider"), d.get("url"), "test", code, ms, err); db.commit()
+    return {"status": code or "ERR", "ok": 200 <= code < 300, "ms": ms, "error": err}
+
+@app.post("/api/me/webhooks/{rid}/test")
+async def me_test_webhook(rid: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    return await _test_target("webhook", rid, user, db)
+
+@app.post("/api/me/integrations/{rid}/test")
+async def me_test_integration(rid: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+    return await _test_target("integration", rid, user, db)
+
+# ---------- Market data (cached 30s, shared by all clients) ----------
+MARKET = {"ts": 0.0, "data": None}
+FX_LIST = ["EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "CNY", "INR", "ZAR", "AED", "KES", "NGN"]
+
+async def get_market():
+    if MARKET["data"] and time.time() - MARKET["ts"] < 30:
+        return MARKET["data"]
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            cg = await c.get("https://api.coingecko.com/api/v3/coins/markets", params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 12, "page": 1})
+            fx = await c.get("https://open.er-api.com/v6/latest/USD")
+        cg.raise_for_status(); fx.raise_for_status()
+        rates = fx.json().get("rates", {})
+        MARKET["data"] = {"crypto": [{"id": x["id"], "symbol": x["symbol"].upper(), "name": x["name"], "price": x["current_price"],
+                                      "change_24h": x.get("price_change_percentage_24h") or 0, "high": x.get("high_24h"), "low": x.get("low_24h"), "volume": x.get("total_volume")} for x in cg.json()],
+                          "forex": {k: rates[k] for k in FX_LIST if k in rates}, "updated": now_str(), "stale": False}
+        MARKET["ts"] = time.time()
+    except Exception:
+        if not MARKET["data"]:
+            raise HTTPException(status_code=503, detail="Market data providers are unreachable right now")
+        MARKET["data"]["stale"] = True
+    return MARKET["data"]
+
+@app.get("/api/market-data")
+async def market_data(user: UserDB = Depends(get_current_user)):
+    return await get_market()
+
+# ---------- Public developer API (X-API-Key) ----------
+def api_key_user(x_api_key: str = Header(None), db=Depends(get_db)):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
+    h = hashlib.sha256(x_api_key.encode()).hexdigest()
+    for r in db.query(UserRecordDB).filter(UserRecordDB.kind == "key").all():
+        d = json.loads(r.data or "{}")
+        if d.get("hash") == h and d.get("status") == "Active":
+            d["last_used"], d["calls"] = now_str(), d.get("calls", 0) + 1
+            r.data = json.dumps(d); db.commit()
+            return db.get(UserDB, r.user_id), d
+    raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+
+@app.get("/api/v1/market-data")
+async def v1_market(auth=Depends(api_key_user)):
+    return await get_market()
+
+@app.get("/api/v1/account")
+def v1_account(auth=Depends(api_key_user), db=Depends(get_db)):
+    u, key = auth
+    return {"name": f"{u.first_name} {u.last_name}", "email": u.email, "company": u.company_name, "key_scope": key["scope"], "key_calls": key["calls"]}
+
+@app.get("/api/v1/bots")
+def v1_bots(auth=Depends(api_key_user), db=Depends(get_db)):
+    u, _ = auth
+    return [urec_out(r) for r in db.query(UserRecordDB).filter(UserRecordDB.user_id == u.id, UserRecordDB.kind == "bot").all()]
+
+@app.post("/api/v1/bots/{rid}/status")
+def v1_bot_status(rid: int, data: TicketStatus, bg: BackgroundTasks, auth=Depends(api_key_user), db=Depends(get_db)):
+    u, key = auth
+    if key["scope"] != "write":
+        raise HTTPException(status_code=403, detail="This key is read-only")
+    if data.status not in ("Running", "Paused", "Stopped"):
+        raise HTTPException(status_code=400, detail="status must be Running, Paused or Stopped")
+    r = own_rec(db, rid, u, "bot")
+    d = json.loads(r.data); d["status"] = data.status; r.data = json.dumps(d); db.commit()
+    audit(db, u.username, "BOT_STATUS_API", f"#{rid} -> {data.status}")
+    bg.add_task(fire, u.id, {"Running": "bot.deployed", "Paused": "bot.paused", "Stopped": "bot.stopped"}[data.status], f"Bot '{d.get('name')}' is now {data.status} (via API)")
+    return urec_out(r)
+
+# ---------- Public platform status ----------
+@app.get("/api/status")
+async def platform_status(db=Depends(get_db)):
+    t0 = time.time(); db.execute(sql_text("select 1")); db_ms = round((time.time() - t0) * 1000)
+    age = time.time() - MARKET["ts"] if MARKET["data"] else None
+    market = ("Operational", "live") if age is not None and age < 300 and not MARKET["data"].get("stale") else (("Degraded", "serving cached prices") if MARKET["data"] else ("Unknown", "no request served yet"))
+    recent = [r for r in REQ_LOG if time.time() - r["ts"] < 300]
+    err = sum(1 for r in recent if r["status"] >= 500)
+    return {"checked_at": now_str(), "uptime_s": int(time.time() - START_TIME),
+            "blocked_24h": sum(1 for r in REQ_LOG if r["error"] == "firewall" and time.time() - r["ts"] < 86400),
+            "components": [
+                {"name": "API Gateway", "status": "Operational" if err == 0 else "Degraded", "detail": f"{len(recent)} requests / 5 min, {err} errors"},
+                {"name": "Database", "status": "Operational", "detail": f"{db_ms} ms query time"},
+                {"name": "Authentication", "status": "Operational", "detail": "Token service active"},
+                {"name": "Market Data Feed", "status": market[0], "detail": market[1]},
+                {"name": "Email Delivery", "status": "Operational" if RESEND_API_KEY else "Not configured", "detail": "Resend API"}]}
