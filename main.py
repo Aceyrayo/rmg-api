@@ -153,17 +153,6 @@ async def send_verification_email(email: str, code: str, name: str):
 
 # 5. SETUP API
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:4321", 
-        "http://127.0.0.1:4321",
-        "https://rmg-site.vercel.app" # <--- Ensure this matches your Vercel URL
-    ], 
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # --- PYDANTIC MODELS ---
 class ContactForm(BaseModel):
@@ -229,8 +218,10 @@ async def register_user(user: UserRegister):
         if db.query(UserDB).filter(UserDB.email == user.email).first():
             raise HTTPException(status_code=400, detail="Email already registered")
         
+        if len(user.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
         hashed_pw = get_password_hash(user.password)
-        code = str(random.randint(100000, 999999))
+        code = str(secrets.randbelow(900000) + 100000)
         
         new_user = UserDB(
             username=user.username, 
@@ -264,7 +255,11 @@ def verify_email(data: VerifyEmail):
         if user.is_verified:
             return {"message": "Account already verified. You can log in."}
         
+        vkey = f"vf:{data.email.lower()}"
+        if not rate_ok(vkey, 8, 900):
+            raise HTTPException(status_code=429, detail="Too many attempts. Please wait 15 minutes or request a new code.")
         if user.verification_code != data.code:
+            rate_hit(vkey)
             raise HTTPException(status_code=400, detail="Invalid verification code")
         
         user.is_verified = True
@@ -278,8 +273,12 @@ def verify_email(data: VerifyEmail):
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     db = SessionLocal()
     try:
+        lkey = f"login:{form_data.username.lower()}:{client_ip(request)}"
+        if not rate_ok(lkey, 8, 900):
+            raise HTTPException(status_code=429, detail="Too many failed attempts. Please wait 15 minutes and try again.")
         user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
         if not user or not verify_password(form_data.password, user.hashed_password):
+            rate_hit(lkey)
             audit(db, form_data.username, "LOGIN_FAILED", client_ip(request))
             raise HTTPException(status_code=400, detail="Incorrect username or password")
         
@@ -1343,3 +1342,86 @@ async def chat(data: ChatIn, request: Request):
             return {"reply": text or "I can't answer that one. Could you rephrase, or contact support@rmgtechnologies.com?"}
     print("[chat] No Gemini model from the fallback list was available")
     raise HTTPException(status_code=502, detail="No AI model is available right now.")
+
+
+
+# ======================= ACCOUNT RECOVERY & RATE LIMITS =======================
+ATTEMPTS: dict = {}
+
+def rate_ok(key: str, limit: int, window: int) -> bool:
+    q, now = ATTEMPTS.setdefault(key, deque()), time.time()
+    while q and now - q[0] > window:
+        q.popleft()
+    return len(q) < limit
+
+def rate_hit(key: str):
+    ATTEMPTS.setdefault(key, deque()).append(time.time())
+
+class ForgotIn(BaseModel):
+    email: EmailStr
+
+class ResetIn(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+class ResendIn(BaseModel):
+    email: EmailStr
+
+@app.post("/api/forgot-password")
+async def forgot_password(data: ForgotIn, request: Request, db=Depends(get_db)):
+    ip = client_ip(request)
+    if not rate_ok(f"fp:{ip}", 5, 900):
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again in a few minutes.")
+    rate_hit(f"fp:{ip}")
+    u = db.query(UserDB).filter(UserDB.email == data.email).first()
+    if u and u.is_verified:
+        code = str(secrets.randbelow(900000) + 100000)
+        u.verification_code = f"reset:{code}:{int(time.time())}"; db.commit()
+        await send_email(u.email, "Reset your RMG password",
+            f"<div style='font-family:sans-serif;max-width:600px;margin:auto;padding:20px;border:1px solid #e2e8f0;border-radius:10px'><h2>Password reset</h2><p>Hello {escape(u.first_name or '')}, use this code to choose a new password. It expires in 15 minutes.</p><h1 style='background:#f1f5f9;padding:15px;border-radius:8px;text-align:center;letter-spacing:5px;color:#2563eb'>{code}</h1><p>If you didn't request this, you can ignore this email — your password has not changed.</p></div>")
+        audit(db, u.username, "PASSWORD_RESET_REQUESTED", ip)
+    return {"message": "If an account exists for that email, a reset code has been sent."}  # same answer either way (no account enumeration)
+
+@app.post("/api/reset-password")
+def reset_password(data: ResetIn, request: Request, db=Depends(get_db)):
+    key = f"rp:{data.email.lower()}"
+    if not rate_ok(key, 5, 900):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please request a new code later.")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    bad = HTTPException(status_code=400, detail="Invalid or expired code")
+    u = db.query(UserDB).filter(UserDB.email == data.email).first()
+    if not u or not (u.verification_code or "").startswith("reset:"):
+        rate_hit(key); raise bad
+    _, code, ts = u.verification_code.split(":")
+    if time.time() - int(ts) > 900 or not hmac.compare_digest(code, data.code.strip()):
+        rate_hit(key); raise bad
+    u.hashed_password = get_password_hash(data.new_password); u.verification_code = None
+    at = int(time.time())
+    db.add(RecordDB(kind="revocation", data=json.dumps({"username": u.username, "at": at}), created_at=now_str())); db.commit()
+    REVOKED[u.username] = at   # sign out every old session
+    audit(db, u.username, "PASSWORD_RESET", client_ip(request))
+    return {"message": "Password updated. You can now sign in."}
+
+@app.post("/api/resend-verification")
+async def resend_verification(data: ResendIn, db=Depends(get_db)):
+    key = f"rv:{data.email.lower()}"
+    if not rate_ok(key, 3, 900):
+        raise HTTPException(status_code=429, detail="Please wait a few minutes before requesting another code.")
+    rate_hit(key)
+    u = db.query(UserDB).filter(UserDB.email == data.email).first()
+    if u and not u.is_verified:
+        code = str(secrets.randbelow(900000) + 100000)
+        u.verification_code = code; db.commit()
+        await send_verification_email(u.email, code, u.first_name)
+    return {"message": "If that account is awaiting verification, a new code has been sent."}
+
+
+# ======================= CORS (must be added LAST so it is the outermost middleware) =======================
+# Allowed origins: localhost, your Vercel URL, any *.vercel.app preview, plus anything in the ALLOWED_ORIGINS env var
+# (comma-separated) - add your custom domain there, e.g. https://www.rmgtechnologies.com
+ALLOWED = ["http://localhost:4321", "http://127.0.0.1:4321", "https://rmg-site.vercel.app"] + \
+          [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED, allow_origin_regex=r"https://.*\.vercel\.app",
+                   allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
