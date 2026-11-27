@@ -1453,6 +1453,12 @@ def waitlist_count(brand: str, db=Depends(get_db)):
     return {"count": len(_wait_rows(db, brand)) if brand in WAIT_BRANDS else 0}
 
 
+# ======================= BIZMANAGER (business management product) =======================
+# bizmanager_api.py must sit next to this file.
+from bizmanager_api import router as biz_router
+app.include_router(biz_router)
+
+
 # ======================= CORS (must be added LAST so it is the outermost middleware) =======================
 # Allowed origins: localhost, your Vercel URL, any *.vercel.app preview, plus anything in the ALLOWED_ORIGINS env var
 # (comma-separated) - add your custom domain there, e.g. https://www.rmgtechnologies.com
