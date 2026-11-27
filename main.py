@@ -1464,6 +1464,10 @@ from bizmanager_api import router as biz_router
 app.include_router(biz_router)
 
 
+# ======================= RMG VAULTBANK (bank management product) =======================
+app.include_router(bank_router)
+
+
 # ======================= CORS (must be added LAST so it is the outermost middleware) =======================
 # Allowed origins: localhost, your Vercel URL, any *.vercel.app preview, plus anything in the ALLOWED_ORIGINS env var
 # (comma-separated) - add your custom domain there, e.g. https://www.rmgtechnologies.com
@@ -1475,5 +1479,3 @@ app.add_middleware(CORSMiddleware, allow_origins=ALLOWED, allow_origin_regex=r"h
 
 
 
-# ======================= RMG VAULTBANK (bank management product) =======================
-app.include_router(bank_router)
