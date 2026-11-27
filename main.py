@@ -13,6 +13,11 @@ import time
 import os
 import httpx
 from html import escape
+from vaultbank_api import router as bank_router
+
+
+
+
 
 # 1. SETUP DATABASE
 SQLALCHEMY_DATABASE_URL = "sqlite:///./rmg_database.db"
@@ -1466,3 +1471,9 @@ ALLOWED = ["http://localhost:4321", "http://127.0.0.1:4321", "https://rmg-site.v
           [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED, allow_origin_regex=r"https://.*\.vercel\.app",
                    allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+
+
+
+
+# ======================= RMG VAULTBANK (bank management product) =======================
+app.include_router(bank_router)
