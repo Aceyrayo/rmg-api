@@ -1,34 +1,188 @@
+from collections import deque
 from datetime import datetime, timedelta
 import hashlib
+import json
 import os
 import secrets
 import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import OAuth2PasswordBearer
 import httpx
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Column, Float, Integer, String, Text
-
-from main import (
-    Base,
-    MARKET,
-    SessionLocal,
-    UserDB,
-    audit,
-    client_ip,
-    get_current_user,
-    get_market,
-    now_str,
-    rate_hit,
-    rate_ok,
-    verify_password,
-)
+from sqlalchemy import Boolean, Column, Float, Integer, String, Text, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 router = APIRouter(prefix="/api/bank", tags=["RMG SavannaBank"])
 
+# ==================== STANDALONE DB & AUTH (NO CIRCULAR IMPORT WITH main.py) ====================
 
-# ==================== DATABASE MODELS ====================
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rmg_database.db")
+if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(SQLALCHEMY_DATABASE_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-rmg-key-change-this-later")
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+
+
+class UserDB(Base):
+    __tablename__ = "users"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String, default="client")
+    first_name = Column(String)
+    last_name = Column(String)
+    email = Column(String, unique=True, index=True)
+    phone = Column(String)
+    company_name = Column(String)
+    job_title = Column(String)
+    is_verified = Column(Boolean, default=False)
+    verification_code = Column(String, nullable=True)
+
+
+class AuditDB(Base):
+    __tablename__ = "audit_log"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor = Column(String)
+    action = Column(String)
+    detail = Column(String)
+    created_at = Column(String)
+
+
+class RecordDB(Base):
+    __tablename__ = "records"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String, index=True)
+    data = Column(Text)
+    created_at = Column(String)
+
+
+def _now_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
+
+
+def _verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def _audit(db, actor: str, action: str, detail: str = ""):
+    try:
+        db.add(AuditDB(actor=actor, action=action, detail=detail, created_at=_now_str()))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _get_revoked_map(db) -> dict:
+    revoked = {}
+    try:
+        for r in db.query(RecordDB).filter(RecordDB.kind == "revocation").all():
+            d = json.loads(r.data or "{}")
+            if d.get("username"):
+                revoked[d["username"]] = max(revoked.get(d["username"], 0), d.get("at", 0))
+    except Exception:
+        pass
+    return revoked
+
+
+def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.username == username).first()
+        if user is None:
+            raise credentials_exception
+        revoked = _get_revoked_map(db)
+        if payload.get("iat", 0) < revoked.get(username, 0):
+            raise HTTPException(status_code=401, detail="Session revoked")
+        return user
+    finally:
+        db.close()
+
+
+_ATTEMPTS: dict = {}
+
+
+def _rate_ok(key: str, limit: int, window: int) -> bool:
+    q, now = _ATTEMPTS.setdefault(key, deque()), time.time()
+    while q and now - q[0] > window:
+        q.popleft()
+    return len(q) < limit
+
+
+def _rate_hit(key: str):
+    _ATTEMPTS.setdefault(key, deque()).append(time.time())
+
+
+_MARKET = {"ts": 0.0, "data": None}
+_FX_LIST = ["EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "CNY", "INR", "ZAR", "AED", "KES", "NGN", "UGX", "TZS"]
+
+
+async def _fetch_market():
+    if _MARKET["data"] and time.time() - _MARKET["ts"] < 30:
+        return _MARKET["data"]
+    async with httpx.AsyncClient(timeout=8) as c:
+        cg = await c.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 12, "page": 1},
+        )
+        fx = await c.get("https://open.er-api.com/v6/latest/USD")
+    cg.raise_for_status()
+    fx.raise_for_status()
+    rates = fx.json().get("rates", {})
+    _MARKET["data"] = {
+        "crypto": [
+            {
+                "id": x["id"],
+                "symbol": x["symbol"].upper(),
+                "name": x["name"],
+                "price": x["current_price"],
+                "change_24h": x.get("price_change_percentage_24h") or 0,
+                "high": x.get("high_24h"),
+                "low": x.get("low_24h"),
+                "volume": x.get("total_volume"),
+            }
+            for x in cg.json()
+        ],
+        "forex": {k: rates[k] for k in _FX_LIST if k in rates},
+        "updated": _now_str(),
+        "stale": False,
+    }
+    _MARKET["ts"] = time.time()
+    return _MARKET["data"]
+
+
+# ==================== BANK DATABASE MODELS ====================
 
 class BankWalletDB(Base):
     __tablename__ = "bank_wallets"
@@ -37,11 +191,11 @@ class BankWalletDB(Base):
     user_id = Column(Integer, index=True)
     account_number = Column(String, unique=True, index=True)
     label = Column(String)
-    wallet_type = Column(String, default="Current")  # Current | Savings | Vault | FX
-    currency = Column(String, default="KES")        # KES | USD | EUR | GBP | NGN | ZAR | UGX | TZS
+    wallet_type = Column(String, default="Current")
+    currency = Column(String, default="KES")
     balance = Column(Float, default=0.0)
     daily_limit = Column(Float, default=500000.0)
-    status = Column(String, default="Active")        # Active | Frozen | Closed
+    status = Column(String, default="Active")
     is_primary = Column(Boolean, default=False)
     created_at = Column(String)
 
@@ -53,14 +207,14 @@ class BankTransactionDB(Base):
     user_id = Column(Integer, index=True)
     wallet_id = Column(Integer, index=True)
     reference = Column(String, unique=True, index=True)
-    tx_type = Column(String)          # deposit | withdrawal | transfer_internal | transfer_external | fx_swap | loan_disburse | loan_repay
-    channel = Column(String)          # SavannaWallet | M-Pesa | Airtel Money | Bank Transfer | PayPal | Card | FX | Loan
+    tx_type = Column(String)
+    channel = Column(String)
     counterparty = Column(String, default="")
     amount = Column(Float)
     fee = Column(Float, default=0.0)
     balance_after = Column(Float)
     currency = Column(String, default="KES")
-    status = Column(String, default="Completed")  # Completed | Pending | Simulated | Failed
+    status = Column(String, default="Completed")
     note = Column(String, default="")
     created_at = Column(String)
 
@@ -72,7 +226,7 @@ class BankLoanDB(Base):
     user_id = Column(Integer, index=True)
     wallet_id = Column(Integer, index=True)
     loan_code = Column(String, unique=True, index=True)
-    product_name = Column(String)      # Savanna Micro-Advance | SME Float Line | Quick Cash Boost
+    product_name = Column(String)
     principal = Column(Float)
     interest_rate_pct = Column(Float)
     fee_amount = Column(Float)
@@ -80,7 +234,7 @@ class BankLoanDB(Base):
     amount_repaid = Column(Float, default=0.0)
     remaining_balance = Column(Float)
     term_days = Column(Integer, default=30)
-    status = Column(String, default="Active")  # Active | Repaid
+    status = Column(String, default="Active")
     due_date = Column(String)
     created_at = Column(String)
 
@@ -98,14 +252,13 @@ class BankSecurityDB(Base):
     updated_at = Column(String)
 
 
-Base.metadata.create_all(bind=SessionLocal().get_bind())
+Base.metadata.create_all(bind=engine)
 
 
 # ==================== CONSTANTS & PRICING ====================
 
 SUPPORTED_CURRENCIES = {"KES", "USD", "EUR", "GBP", "NGN", "ZAR", "UGX", "TZS"}
 
-# Transparent fallback rates relative to 1 USD (used if live FX feed is unavailable)
 FALLBACK_USD_RATES = {
     "USD": 1.0,
     "KES": 129.0,
@@ -117,14 +270,12 @@ FALLBACK_USD_RATES = {
     "TZS": 2680.0,
 }
 
-# Small, transparent, affordable micro-loan tiers (KES or USD equivalent)
 LOAN_TIERS = {
     "Savanna Micro-Advance": {"max_kes": 50000.0, "rate_pct": 4.5, "fee_pct": 1.0, "term_days": 14},
     "Quick Cash Boost": {"max_kes": 150000.0, "rate_pct": 6.5, "fee_pct": 1.5, "term_days": 30},
     "SME Float Line": {"max_kes": 350000.0, "rate_pct": 8.0, "fee_pct": 1.5, "term_days": 45},
 }
 
-# Curated NSE (Nairobi Securities Exchange) counters + live fallback baseline
 NSE_COUNTERS = [
     {"ticker": "SCOM", "name": "Safaricom PLC", "sector": "Telecommunications", "price": 37.05, "change_pct": 0.38, "volume": 8109142},
     {"ticker": "EQTY", "name": "Equity Group Holdings PLC", "sector": "Banking", "price": 92.25, "change_pct": -1.07, "volume": 2513348},
@@ -155,9 +306,8 @@ def _gen_ref(prefix: str = "SVB") -> str:
 
 
 def _get_fx_rates() -> dict:
-    """Returns USD-based rates mapping currency -> units per 1 USD."""
     rates = dict(FALLBACK_USD_RATES)
-    mdata = MARKET.get("data") if isinstance(MARKET, dict) else None
+    mdata = _MARKET.get("data") if isinstance(_MARKET, dict) else None
     if mdata and isinstance(mdata.get("forex"), dict):
         for k, v in mdata["forex"].items():
             if isinstance(v, (int, float)) and v > 0:
@@ -186,7 +336,7 @@ def _get_or_init_security(db, user_id: int) -> BankSecurityDB:
             two_fa_enabled=True,
             require_pin_above=5000.0,
             anti_phish_phrase="SAVANNA-GUARD",
-            updated_at=now_str(),
+            updated_at=_now_str(),
         )
         db.add(sec)
         db.commit()
@@ -195,7 +345,6 @@ def _get_or_init_security(db, user_id: int) -> BankSecurityDB:
 
 
 def _ensure_starter_wallets(db, user: UserDB):
-    """Creates starter KES Current & USD Treasury wallets on first visit so users can test immediately."""
     existing = db.query(BankWalletDB).filter(BankWalletDB.user_id == user.id).all()
     if existing:
         return existing
@@ -262,10 +411,6 @@ def _ensure_starter_wallets(db, user: UserDB):
     return [w1, w2]
 
 
-def _now_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _verify_tx_pin(db, user: UserDB, sec: BankSecurityDB, pin: Optional[str], amount: float, account_password: Optional[str]):
     now_ts = time.time()
     if sec.locked_until and now_ts < sec.locked_until:
@@ -276,15 +421,15 @@ def _verify_tx_pin(db, user: UserDB, sec: BankSecurityDB, pin: Optional[str], am
     if needs_pin:
         if not pin or _hash_pin(pin) != sec.pin_hash:
             fail_key = f"bank_pin:{user.id}"
-            rate_hit(fail_key)
-            if not rate_ok(fail_key, 5, 600):
+            _rate_hit(fail_key)
+            if not _rate_ok(fail_key, 5, 600):
                 sec.locked_until = now_ts + 600
                 db.commit()
                 raise HTTPException(status_code=423, detail="Too many incorrect PIN attempts. Locked for 10 minutes.")
             raise HTTPException(status_code=403, detail="Invalid or missing 4–6 digit Transaction PIN")
 
     if account_password:
-        if not verify_password(account_password, user.hashed_password):
+        if not _verify_password(account_password, user.hashed_password):
             raise HTTPException(status_code=403, detail="Account password verification failed")
 
 
@@ -351,13 +496,13 @@ class CreateWalletIn(BaseModel):
 
 
 class WalletStatusIn(BaseModel):
-    status: str  # Active | Frozen | Closed
+    status: str
 
 
 class DepositIn(BaseModel):
     wallet_id: int
     amount: float = Field(..., gt=0)
-    channel: str = "M-Pesa"  # M-Pesa | Airtel Money | Bank Transfer | PayPal | Card | SavannaWallet
+    channel: str = "M-Pesa"
     source_detail: str = Field("", max_length=120)
     note: str = Field("", max_length=200)
     pin: Optional[str] = None
@@ -365,8 +510,8 @@ class DepositIn(BaseModel):
 
 class SendMoneyIn(BaseModel):
     from_wallet_id: int
-    channel: str = "M-Pesa"  # SavannaWallet | M-Pesa | Airtel Money | Bank Transfer | PayPal | Card
-    recipient: str = Field(..., min_length=2, max_length=140)  # Account number, 2547.../07..., bank acct/IBAN, or PayPal email
+    channel: str = "M-Pesa"
+    recipient: str = Field(..., min_length=2, max_length=140)
     recipient_name: str = Field("", max_length=100)
     amount: float = Field(..., gt=0)
     note: str = Field("", max_length=200)
@@ -455,7 +600,7 @@ def bank_overview(request: Request, current_user: UserDB = Depends(get_current_u
                 "two_fa_enabled": bool(sec.two_fa_enabled),
                 "require_pin_above": round(sec.require_pin_above or 0.0, 2),
                 "anti_phish_phrase": sec.anti_phish_phrase,
-                "client_ip": client_ip(request),
+                "client_ip": _client_ip(request),
             },
             "fx_rates_from_usd": _get_fx_rates(),
             "loan_tiers": LOAN_TIERS,
@@ -537,7 +682,7 @@ def create_wallet(data: CreateWalletIn, current_user: UserDB = Depends(get_curre
             )
         db.commit()
         db.refresh(w)
-        audit(db, current_user.username, "BANK_WALLET_CREATE", f"{w.account_number} ({w.currency})")
+        _audit(db, current_user.username, "BANK_WALLET_CREATE", f"{w.account_number} ({w.currency})")
         return _wallet_dict(w)
     finally:
         db.close()
@@ -556,7 +701,7 @@ def set_wallet_status(wallet_id: int, data: WalletStatusIn, current_user: UserDB
             raise HTTPException(status_code=400, detail="Transfer or withdraw remaining funds before closing a wallet")
         w.status = data.status
         db.commit()
-        audit(db, current_user.username, "BANK_WALLET_STATUS", f"{w.account_number} -> {data.status}")
+        _audit(db, current_user.username, "BANK_WALLET_STATUS", f"{w.account_number} -> {data.status}")
         return _wallet_dict(w)
     finally:
         db.close()
@@ -621,7 +766,7 @@ def deposit_funds(data: DepositIn, current_user: UserDB = Depends(get_current_us
         db.add(tx)
         db.commit()
         db.refresh(tx)
-        audit(db, current_user.username, "BANK_DEPOSIT", f"{w.account_number} +{net_credit:.2f} {w.currency} ({data.channel})")
+        _audit(db, current_user.username, "BANK_DEPOSIT", f"{w.account_number} +{net_credit:.2f} {w.currency} ({data.channel})")
         return {"message": f"Deposited {net_credit:.2f} {w.currency} via {data.channel}", "wallet": _wallet_dict(w), "transaction": _tx_dict(tx)}
     finally:
         db.close()
@@ -658,7 +803,6 @@ def send_money(data: SendMoneyIn, current_user: UserDB = Depends(get_current_use
         ref = _gen_ref("SND")
         target_clean = data.recipient.strip()
 
-        # Check if recipient is another SavannaBank account number (internal transfer)
         dest_wallet = db.query(BankWalletDB).filter(BankWalletDB.account_number == target_clean.upper()).first()
         if dest_wallet and dest_wallet.id == src.id:
             raise HTTPException(status_code=400, detail="Cannot send funds to the same wallet")
@@ -707,7 +851,7 @@ def send_money(data: SendMoneyIn, current_user: UserDB = Depends(get_current_use
 
         db.commit()
         db.refresh(out_tx)
-        audit(db, current_user.username, "BANK_SEND", f"{src.account_number} -> {target_clean} {amt:.2f} {src.currency} via {data.channel}")
+        _audit(db, current_user.username, "BANK_SEND", f"{src.account_number} -> {target_clean} {amt:.2f} {src.currency} via {data.channel}")
         return {
             "message": f"Sent {amt:.2f} {src.currency} via {data.channel} (Ref: {ref})",
             "wallet": _wallet_dict(src),
@@ -781,7 +925,7 @@ def fx_swap(data: FxSwapIn, current_user: UserDB = Depends(get_current_user)):
         )
         db.add(in_tx)
         db.commit()
-        audit(db, current_user.username, "BANK_FX_SWAP", f"{amt:.2f} {src.currency} -> {converted:.2f} {dst.currency}")
+        _audit(db, current_user.username, "BANK_FX_SWAP", f"{amt:.2f} {src.currency} -> {converted:.2f} {dst.currency}")
         return {
             "message": f"Converted {amt:.2f} {src.currency} into {converted:.2f} {dst.currency}",
             "from_wallet": _wallet_dict(src),
@@ -879,7 +1023,7 @@ def apply_loan(data: LoanApplyIn, current_user: UserDB = Depends(get_current_use
         )
         db.commit()
         db.refresh(loan)
-        audit(db, current_user.username, "BANK_LOAN_APPLY", f"{loan.loan_code} {amt:.2f} {w.currency}")
+        _audit(db, current_user.username, "BANK_LOAN_APPLY", f"{loan.loan_code} {amt:.2f} {w.currency}")
         return {"message": f"Disbursed {net_disbursed:.2f} {w.currency} ({loan.loan_code})", "loan": _loan_dict(loan), "wallet": _wallet_dict(w)}
     finally:
         db.close()
@@ -929,7 +1073,7 @@ def repay_loan(loan_id: int, data: LoanRepayIn, current_user: UserDB = Depends(g
         )
         db.commit()
         db.refresh(loan)
-        audit(db, current_user.username, "BANK_LOAN_REPAY", f"{loan.loan_code} paid {pay_amt:.2f}")
+        _audit(db, current_user.username, "BANK_LOAN_REPAY", f"{loan.loan_code} paid {pay_amt:.2f}")
         return {"message": f"Repaid {pay_amt:.2f} {w.currency}", "loan": _loan_dict(loan), "wallet": _wallet_dict(w)}
     finally:
         db.close()
@@ -945,13 +1089,12 @@ async def bank_markets(current_user: UserDB = Depends(get_current_user)):
     updated_at = _now_str()
 
     try:
-        m = await get_market()
+        m = await _fetch_market()
         crypto_rows = m.get("crypto") or []
         forex_rates.update(m.get("forex") or {})
         market_stale = bool(m.get("stale"))
         updated_at = m.get("updated") or updated_at
     except Exception:
-        # Fallback sample crypto prices when external APIs are unreachable offline/in sandbox
         crypto_rows = [
             {"id": "bitcoin", "symbol": "BTC", "name": "Bitcoin", "price": 94250.0, "change_24h": 2.14, "volume": 38400000000},
             {"id": "ethereum", "symbol": "ETH", "name": "Ethereum", "price": 3280.0, "change_24h": 1.45, "volume": 17200000000},
@@ -959,7 +1102,6 @@ async def bank_markets(current_user: UserDB = Depends(get_current_user)):
             {"id": "binancecoin", "symbol": "BNB", "name": "BNB", "price": 645.0, "change_24h": -0.65, "volume": 2100000000},
         ]
 
-    # Optional live NSE scraper endpoint if configured via env
     nse_url = os.getenv("NSE_API_URL", "").strip()
     nse_key = os.getenv("NSE_API_KEY", "").strip()
     nse_rows = [dict(x) for x in NSE_COUNTERS]
@@ -974,16 +1116,17 @@ async def bank_markets(current_user: UserDB = Depends(get_current_user)):
                     payload = resp.json()
                     items = payload.get("data") if isinstance(payload, dict) else payload
                     if isinstance(items, list) and items:
-                        parsed = []
-                        for it in items[:15]:
-                            parsed.append({
+                        parsed = [
+                            {
                                 "ticker": it.get("ticker", "NSE"),
                                 "name": it.get("name", "NSE Listed Security"),
                                 "sector": it.get("sector", "Equities"),
                                 "price": float(it.get("price", 0) or 0),
                                 "change_pct": float(it.get("change", 0) or 0),
                                 "volume": int(float(it.get("volume", 0) or 0)),
-                            })
+                            }
+                            for it in items[:15]
+                        ]
                         if parsed:
                             NSE_CACHE["data"] = parsed
                             NSE_CACHE["ts"] = time.time()
@@ -995,13 +1138,10 @@ async def bank_markets(current_user: UserDB = Depends(get_current_user)):
         nse_live = True
 
     kes_per_usd = float(forex_rates.get("KES", 129.0) or 129.0)
-    enriched_crypto = []
-    for c in crypto_rows:
-        usd_p = float(c.get("price") or 0.0)
-        enriched_crypto.append({
-            **c,
-            "price_kes": round(usd_p * kes_per_usd, 2),
-        })
+    enriched_crypto = [
+        {**c, "price_kes": round(float(c.get("price") or 0.0) * kes_per_usd, 2)}
+        for c in crypto_rows
+    ]
 
     return {
         "updated_at": updated_at,
@@ -1057,7 +1197,7 @@ def update_bank_security(data: SecurityUpdateIn, request: Request, current_user:
         sec.anti_phish_phrase = data.anti_phish_phrase.strip()
         sec.updated_at = _now_str()
         db.commit()
-        audit(db, current_user.username, "BANK_SECURITY_UPDATE", f"ip={client_ip(request)} pin_set={bool(sec.pin_hash)}")
+        _audit(db, current_user.username, "BANK_SECURITY_UPDATE", f"ip={_client_ip(request)} pin_set={bool(sec.pin_hash)}")
         return {
             "message": "SavannaBank security policy updated",
             "has_pin": bool(sec.pin_hash),
