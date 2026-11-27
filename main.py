@@ -619,7 +619,7 @@ class RecordDB(Base):
 Base.metadata.create_all(bind=engine)
 
 KINDS = {"trading_engine", "defense_protocol", "enterprise_node", "update", "rollback", "subscription",
-         "transaction", "payout", "announcement", "firewall", "webhook", "webhook_log", "key", "revocation"}
+         "transaction", "payout", "announcement", "firewall", "webhook", "webhook_log", "key", "revocation", "waitlist"}
 NO_GENERIC_CREATE = {"key", "revocation", "webhook_log"}
 START_TIME = time.time()
 REQ_LOG = deque(maxlen=1000)
@@ -1416,6 +1416,41 @@ async def resend_verification(data: ResendIn, db=Depends(get_db)):
         u.verification_code = code; db.commit()
         await send_verification_email(u.email, code, u.first_name)
     return {"message": "If that account is awaiting verification, a new code has been sent."}
+
+
+# ======================= GAME STUDIO WAITLISTS (ReezGames / ClutchCo) =======================
+WAIT_BRANDS = {"ReezGames", "ClutchCo"}
+
+class WaitIn(BaseModel):
+    email: EmailStr
+    brand: str
+
+def _wait_rows(db, brand=None):
+    out = []
+    for r in db.query(RecordDB).filter(RecordDB.kind == "waitlist").all():
+        d = json.loads(r.data or "{}")
+        if brand is None or d.get("brand") == brand:
+            out.append(d)
+    return out
+
+@app.post("/api/waitlist")
+def waitlist_join(data: WaitIn, request: Request, db=Depends(get_db)):
+    if data.brand not in WAIT_BRANDS:
+        raise HTTPException(status_code=400, detail="Unknown studio")
+    key = f"wl:{client_ip(request)}"
+    if not rate_ok(key, 6, 3600):
+        raise HTTPException(status_code=429, detail="Too many sign-ups from this connection. Please try again later.")
+    rate_hit(key)
+    em, rows = data.email.lower(), _wait_rows(db, data.brand)
+    if any(d.get("email") == em for d in rows):
+        return {"message": "You're already on the list — we'll be in touch!", "count": len(rows)}
+    db.add(RecordDB(kind="waitlist", data=json.dumps({"email": em, "brand": data.brand, "status": "New"}), created_at=now_str()))
+    db.commit()
+    return {"message": "You're on the list! We'll email you at launch.", "count": len(rows) + 1}
+
+@app.get("/api/waitlist/count")
+def waitlist_count(brand: str, db=Depends(get_db)):
+    return {"count": len(_wait_rows(db, brand)) if brand in WAIT_BRANDS else 0}
 
 
 # ======================= CORS (must be added LAST so it is the outermost middleware) =======================
