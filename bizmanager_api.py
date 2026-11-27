@@ -159,19 +159,26 @@ def ws_dict(ws, role):
     days = None
     if ws.plan == "trial" and ws.trial_ends:
         days = (datetime.strptime(ws.trial_ends, "%Y-%m-%d").date() - datetime.utcnow().date()).days
-    return {"id": ws.id, "name": ws.name, "currency": ws.currency, "tax_rate": ws.tax_rate, "address": ws.address, "phone": ws.phone,
-            "email": ws.email, "invoice_prefix": ws.invoice_prefix, "plan": ws.plan, "trial_ends": ws.trial_ends, "days_left": days,
-            "writable": is_writable(ws), "role": role, "perms": sorted(PERMS.get(role, set()))}
+    return {
+        "id": ws.id, "name": ws.name, "currency": ws.currency, "tax_rate": ws.tax_rate,
+        "address": ws.address, "phone": ws.phone, "email": ws.email,
+        "invoice_prefix": ws.invoice_prefix, "plan": ws.plan, "trial_ends": ws.trial_ends,
+        "days_left": days, "writable": is_writable(ws), "role": role,
+        "perms": sorted(PERMS.get(role, set()))
+    }
 
 def access(db, ws_id: int, user, perm: str = "view", write: bool = False):
     """Return (workspace, role) or raise. Enforces tenant isolation, role permissions and trial/plan status."""
     ws = db.get(BizWorkspace, ws_id)
     if not ws:
         raise HTTPException(status_code=404, detail="Business not found")
-    role = "Owner" if ws.owner_id == user.id else None
-    if not role:
-        m = db.query(BizMember).filter(BizMember.ws_id == ws_id, BizMember.user_id == user.id, BizMember.status == "Active").first()
-        role = m.role if m else None
+    if getattr(user, "role", None) == "admin":
+        role = "Owner"
+    else:
+        role = "Owner" if ws.owner_id == user.id else None
+        if not role:
+            m = db.query(BizMember).filter(BizMember.ws_id == ws_id, BizMember.user_id == user.id, BizMember.status == "Active").first()
+            role = m.role if m else None
     if not role:
         raise HTTPException(status_code=404, detail="Business not found")
     if perm not in PERMS.get(role, set()):
@@ -206,11 +213,16 @@ class SettingsIn(BaseModel):
 
 @router.get("/workspaces")
 def my_workspaces(user: UserDB = Depends(get_current_user), db=Depends(get_db)):
-    out = [ws_dict(w, "Owner") for w in db.query(BizWorkspace).filter(BizWorkspace.owner_id == user.id).all()]
-    for m in db.query(BizMember).filter(BizMember.user_id == user.id, BizMember.status == "Active").all():
-        w = db.get(BizWorkspace, m.ws_id)
-        if w:
-            out.append(ws_dict(w, m.role))
+    if getattr(user, "role", None) == "admin":
+        out = [ws_dict(w, "Owner") for w in db.query(BizWorkspace).order_by(BizWorkspace.id.desc()).all()]
+    else:
+        out = [ws_dict(w, "Owner") for w in db.query(BizWorkspace).filter(BizWorkspace.owner_id == user.id).all()]
+        seen = {w["id"] for w in out}
+        for m in db.query(BizMember).filter(BizMember.user_id == user.id, BizMember.status == "Active").all():
+            w = db.get(BizWorkspace, m.ws_id)
+            if w and w.id not in seen:
+                out.append(ws_dict(w, m.role))
+                seen.add(w.id)
     invites = []
     for m in db.query(BizMember).filter(BizMember.status == "Invited", func.lower(BizMember.email) == user.email.lower()).all():
         w = db.get(BizWorkspace, m.ws_id)
@@ -224,9 +236,13 @@ def create_workspace(data: WorkspaceIn, user: UserDB = Depends(get_current_user)
         bad(f"You can own up to {MAX_WORKSPACES} businesses.")
     if not clean(data.name):
         bad("Enter your business name.")
-    ws = BizWorkspace(owner_id=user.id, name=clean(data.name), currency=(data.currency or "USD").upper()[:3], tax_rate=max(0, min(data.tax_rate, 100)),
-                      address=clean(data.address, 200), phone=clean(data.phone, 40), email=clean(data.email, 120),
-                      trial_ends=(datetime.utcnow() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d"), created_at=now_str())
+    ws = BizWorkspace(
+        owner_id=user.id, name=clean(data.name), currency=(data.currency or "USD").upper()[:3],
+        tax_rate=max(0, min(data.tax_rate, 100)), address=clean(data.address, 200),
+        phone=clean(data.phone, 40), email=clean(data.email, 120),
+        trial_ends=(datetime.utcnow() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d"),
+        created_at=now_str()
+    )
     db.add(ws); db.commit()
     audit(db, user.username, "BIZ_CREATE", ws.name)
     return ws_dict(ws, "Owner")
@@ -298,9 +314,11 @@ def member_invite(ws_id: int, data: MemberIn, bg: BackgroundTasks, user: UserDB 
         bad("Team limit reached.")
     m = BizMember(ws_id=ws_id, email=em, role=data.role, status="Invited", created_at=now_str())
     db.add(m); db.commit()
-    bg.add_task(send_email, em, f"You've been invited to {ws.name} on RMG BizManager",
-                f"<div style='font-family:sans-serif'><h2>You're invited</h2><p>{user.first_name} {user.last_name} invited you to join <b>{ws.name}</b> as <b>{data.role}</b>.</p>"
-                f"<p>Sign in (or create an account with this email) at your RMG site and open <b>BizManager</b> to accept.</p></div>")
+    bg.add_task(
+        send_email, em, f"You've been invited to {ws.name} on RMG BizManager",
+        f"<div style='font-family:sans-serif'><h2>You're invited</h2><p>{user.first_name} {user.last_name} invited you to join <b>{ws.name}</b> as <b>{data.role}</b>.</p>"
+        f"<p>Sign in (or create an account with this email) at your RMG site and open <b>BizManager</b> to accept.</p></div>"
+    )
     audit(db, user.username, "BIZ_INVITE", f"{em} as {data.role}")
     return {"id": m.id, "email": em, "role": data.role, "status": "Invited"}
 
@@ -355,9 +373,12 @@ class BulkIn(BaseModel):
     items: List[ProductIn]
 
 def prod_out(p):
-    return {"id": p.id, "name": p.name, "sku": p.sku, "category": p.category, "unit": p.unit, "price": p.price, "cost": p.cost, "stock": p.stock,
-            "low_stock": p.low_stock, "active": p.active, "low": bool(p.active and p.stock <= p.low_stock),
-            "margin": r2((p.price - p.cost) / p.price * 100) if p.price else 0}
+    return {
+        "id": p.id, "name": p.name, "sku": p.sku, "category": p.category, "unit": p.unit,
+        "price": p.price, "cost": p.cost, "stock": p.stock, "low_stock": p.low_stock,
+        "active": p.active, "low": bool(p.active and p.stock <= p.low_stock),
+        "margin": r2((p.price - p.cost) / p.price * 100) if p.price else 0
+    }
 
 def check_product(d):
     if not clean(d.name):
@@ -380,8 +401,11 @@ def product_create(ws_id: int, data: ProductIn, user: UserDB = Depends(get_curre
     sku = clean(data.sku, 40)
     if sku and db.query(BizProduct).filter(BizProduct.ws_id == ws_id, BizProduct.sku == sku).first():
         bad("A product with that SKU already exists.")
-    p = BizProduct(ws_id=ws_id, name=clean(data.name), sku=sku, category=clean(data.category, 60), unit=clean(data.unit, 12) or "pcs", price=r2(data.price),
-                   cost=r2(data.cost), stock=data.stock, low_stock=data.low_stock, active=True, created_at=now_str())
+    p = BizProduct(
+        ws_id=ws_id, name=clean(data.name), sku=sku, category=clean(data.category, 60),
+        unit=clean(data.unit, 12) or "pcs", price=r2(data.price), cost=r2(data.cost),
+        stock=data.stock, low_stock=data.low_stock, active=True, created_at=now_str()
+    )
     db.add(p); db.flush()
     if data.stock:
         db.add(BizStock(ws_id=ws_id, product_id=p.id, delta=data.stock, reason="Opening stock", ref="", balance=data.stock, created_at=now_str()))
@@ -399,8 +423,11 @@ def product_bulk(ws_id: int, data: BulkIn, user: UserDB = Depends(get_current_us
         sku = clean(d.sku, 40)
         if not clean(d.name) or min(d.price, d.cost, d.stock, d.low_stock) < 0 or (sku and sku in have):
             skipped += 1; continue
-        p = BizProduct(ws_id=ws_id, name=clean(d.name), sku=sku, category=clean(d.category, 60), unit=clean(d.unit, 12) or "pcs", price=r2(d.price),
-                       cost=r2(d.cost), stock=d.stock, low_stock=d.low_stock, active=True, created_at=now_str())
+        p = BizProduct(
+            ws_id=ws_id, name=clean(d.name), sku=sku, category=clean(d.category, 60),
+            unit=clean(d.unit, 12) or "pcs", price=r2(d.price), cost=r2(d.cost),
+            stock=d.stock, low_stock=d.low_stock, active=True, created_at=now_str()
+        )
         db.add(p); db.flush()
         if d.stock:
             db.add(BizStock(ws_id=ws_id, product_id=p.id, delta=d.stock, reason="Opening stock", ref="import", balance=d.stock, created_at=now_str()))
@@ -439,7 +466,7 @@ def product_update(ws_id: int, pid: int, data: ProductPatch, user: UserDB = Depe
 def product_archive(ws_id: int, pid: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
     access(db, ws_id, user, "inventory", write=True)
     p = get_product(db, ws_id, pid)
-    p.active = False; db.commit()   # archived, never deleted: past sales keep their history
+    p.active = False; db.commit()
     return {"message": "Product archived"}
 
 @router.post("/{ws_id}/products/{pid}/adjust")
@@ -451,7 +478,7 @@ def product_adjust(ws_id: int, pid: int, data: AdjustIn, user: UserDB = Depends(
     new = p.stock + data.delta
     if new < -1e-9:
         bad(f"Cannot remove more than the {p.stock:g} in stock.")
-    if data.cost is not None and data.delta > 0 and data.cost >= 0:   # weighted-average cost on restock
+    if data.cost is not None and data.delta > 0 and data.cost >= 0:
         p.cost = r2((p.stock * p.cost + data.delta * data.cost) / new) if new > 0 else r2(data.cost)
     p.stock = max(new, 0)
     db.add(BizStock(ws_id=ws_id, product_id=p.id, delta=data.delta, reason=clean(data.reason, 60) or "Adjustment", ref=user.username, balance=p.stock, created_at=now_str()))
@@ -474,7 +501,6 @@ class CustomerIn(BaseModel):
     notes: str = ""
 
 def sale_totals(db, ws_id):
-    """Per-customer billed total and outstanding balance (void documents excluded)."""
     stats = defaultdict(lambda: {"billed": 0.0, "balance": 0.0, "count": 0})
     for s in db.query(BizSale).filter(BizSale.ws_id == ws_id, BizSale.status != "Void", BizSale.customer_id.isnot(None)).all():
         c = stats[s.customer_id]
@@ -483,8 +509,10 @@ def sale_totals(db, ws_id):
 
 def cust_out(c, st=None):
     st = st or {"billed": 0, "balance": 0, "count": 0}
-    return {"id": c.id, "name": c.name, "email": c.email, "phone": c.phone, "address": c.address, "notes": c.notes,
-            "billed": r2(st["billed"]), "balance": r2(st["balance"]), "documents": st["count"]}
+    return {
+        "id": c.id, "name": c.name, "email": c.email, "phone": c.phone, "address": c.address, "notes": c.notes,
+        "billed": r2(st["billed"]), "balance": r2(st["balance"]), "documents": st["count"]
+    }
 
 @router.get("/{ws_id}/customers")
 def customers_list(ws_id: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
@@ -561,10 +589,13 @@ def sale_status(total, paid):
 
 def sale_out(s, detail=False, payments=None, today=None):
     today = today or today_utc()
-    out = {"id": s.id, "number": s.number, "kind": s.kind, "customer_id": s.customer_id, "customer_name": s.customer_name, "subtotal": s.subtotal,
-           "discount": s.discount, "tax": s.tax, "total": s.total, "paid": s.paid, "balance": r2(max(s.total - s.paid, 0)), "method": s.method,
-           "status": s.status, "date": s.date, "due_date": s.due_date, "notes": s.notes,
-           "overdue": bool(s.status in ("Unpaid", "Partial") and s.due_date and s.due_date < today)}
+    out = {
+        "id": s.id, "number": s.number, "kind": s.kind, "customer_id": s.customer_id,
+        "customer_name": s.customer_name, "subtotal": s.subtotal, "discount": s.discount,
+        "tax": s.tax, "total": s.total, "paid": s.paid, "balance": r2(max(s.total - s.paid, 0)),
+        "method": s.method, "status": s.status, "date": s.date, "due_date": s.due_date,
+        "notes": s.notes, "overdue": bool(s.status in ("Unpaid", "Partial") and s.due_date and s.due_date < today)
+    }
     if detail:
         out["items"] = json.loads(s.items or "[]")
         out["payments"] = [{"id": p.id, "amount": p.amount, "method": p.method, "date": p.date, "note": p.note} for p in (payments or [])]
@@ -611,10 +642,14 @@ def sale_create(ws_id: int, data: SaleIn, user: UserDB = Depends(get_current_use
         bad("Invoices need a customer.")
     paid = total if (data.kind == "sale" and data.paid is None) else r2(min(max(data.paid or 0, 0), total))
     day = ds(data.date, today_utc())
-    s = BizSale(ws_id=ws_id, number=f"{'RCT' if data.kind == 'sale' else (ws.invoice_prefix or 'INV')}-{ws.next_number:05d}", kind=data.kind,
-                customer_id=data.customer_id, customer_name=cname, items=json.dumps(lines), subtotal=subtotal, discount=discount, tax=tax, total=total,
-                paid=paid, method=clean(data.method, 30) or "Cash", status=sale_status(total, paid), date=day,
-                due_date=ds(data.due_date) if data.kind == "invoice" else None, notes=clean(data.notes, 500), created_by=user.id, created_at=now_str())
+    s = BizSale(
+        ws_id=ws_id, number=f"{'RCT' if data.kind == 'sale' else (ws.invoice_prefix or 'INV')}-{ws.next_number:05d}",
+        kind=data.kind, customer_id=data.customer_id, customer_name=cname, items=json.dumps(lines),
+        subtotal=subtotal, discount=discount, tax=tax, total=total, paid=paid,
+        method=clean(data.method, 30) or "Cash", status=sale_status(total, paid), date=day,
+        due_date=ds(data.due_date) if data.kind == "invoice" else None, notes=clean(data.notes, 500),
+        created_by=user.id, created_at=now_str()
+    )
     ws.next_number += 1
     db.add(s); db.flush()
     for pid, q in need.items():
@@ -627,8 +662,10 @@ def sale_create(ws_id: int, data: SaleIn, user: UserDB = Depends(get_current_use
     return sale_out(s, True, db.query(BizPayment).filter(BizPayment.sale_id == s.id).all())
 
 @router.get("/{ws_id}/sales")
-def sales_list(ws_id: int, kind: str = "", status: str = "", q: str = "", date_from: str = "", date_to: str = "", customer_id: int = 0,
-               user: UserDB = Depends(get_current_user), db=Depends(get_db)):
+def sales_list(
+    ws_id: int, kind: str = "", status: str = "", q: str = "", date_from: str = "",
+    date_to: str = "", customer_id: int = 0, user: UserDB = Depends(get_current_user), db=Depends(get_db)
+):
     access(db, ws_id, user, "view")
     qry = db.query(BizSale).filter(BizSale.ws_id == ws_id)
     if kind in ("sale", "invoice"): qry = qry.filter(BizSale.kind == kind)
@@ -675,7 +712,7 @@ def sale_void(ws_id: int, sid: int, user: UserDB = Depends(get_current_user), db
     s = get_sale(db, ws_id, sid)
     if s.status == "Void":
         bad("Already void.")
-    for l in json.loads(s.items or "[]"):   # put the stock back
+    for l in json.loads(s.items or "[]"):
         p = db.get(BizProduct, l.get("product_id")) if l.get("product_id") else None
         if p and p.ws_id == ws_id:
             p.stock += l["qty"]
@@ -697,10 +734,12 @@ def sale_email(ws_id: int, sid: int, data: EmailIn, bg: BackgroundTasks, user: U
         bad("Email limit reached for this hour. Try again later.")
     rate_hit(f"bizmail:{ws_id}")
     rows = "".join(f"<tr><td style='padding:6px 8px;border-bottom:1px solid #e2e8f0'>{l['name']}</td><td style='padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right'>{l['qty']:g}</td><td style='padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right'>{l['total']:.2f}</td></tr>" for l in json.loads(s.items or "[]"))
-    html = (f"<div style='font-family:sans-serif;max-width:620px;margin:auto'><h2>{ws.name}</h2><p>{'Invoice' if s.kind == 'invoice' else 'Receipt'} <b>{s.number}</b> · {s.date}</p>"
-            f"<table style='width:100%;border-collapse:collapse'><tr><th align=left>Item</th><th align=right>Qty</th><th align=right>Amount</th></tr>{rows}</table>"
-            f"<p style='text-align:right'>Total <b>{ws.currency} {s.total:.2f}</b><br>Paid {s.paid:.2f} · Balance <b>{max(s.total - s.paid, 0):.2f}</b></p>"
-            f"{'<p>Due date: ' + s.due_date + '</p>' if s.due_date else ''}<p style='color:#64748b'>{ws.phone} {ws.email}</p></div>")
+    html = (
+        f"<div style='font-family:sans-serif;max-width:620px;margin:auto'><h2>{ws.name}</h2><p>{'Invoice' if s.kind == 'invoice' else 'Receipt'} <b>{s.number}</b> · {s.date}</p>"
+        f"<table style='width:100%;border-collapse:collapse'><tr><th align=left>Item</th><th align=right>Qty</th><th align=right>Amount</th></tr>{rows}</table>"
+        f"<p style='text-align:right'>Total <b>{ws.currency} {s.total:.2f}</b><br>Paid {s.paid:.2f} · Balance <b>{max(s.total - s.paid, 0):.2f}</b></p>"
+        f"{'<p>Due date: ' + s.due_date + '</p>' if s.due_date else ''}<p style='color:#64748b'>{ws.phone} {ws.email}</p></div>"
+    )
     bg.add_task(send_email, to, f"{'Invoice' if s.kind == 'invoice' else 'Receipt'} {s.number} from {ws.name}", html)
     return {"message": f"Sent to {to}"}
 
@@ -728,8 +767,7 @@ def expense_create(ws_id: int, data: ExpenseIn, user: UserDB = Depends(get_curre
     access(db, ws_id, user, "finance", write=True)
     if data.amount <= 0:
         bad("Amount must be greater than zero.")
-    e = BizExpense(ws_id=ws_id, category=clean(data.category, 40) or "General", vendor=clean(data.vendor, 80), description=clean(data.description, 200),
-                   amount=r2(data.amount), date=ds(data.date, today_utc()), created_by=user.id, created_at=now_str())
+    e = BizExpense(ws_id=ws_id, category=clean(data.category, 40) or "General", vendor=clean(data.vendor, 80), description=clean(data.description, 200), amount=r2(data.amount), date=ds(data.date, today_utc()), created_by=user.id, created_at=now_str())
     db.add(e); db.commit()
     return exp_out(e)
 
@@ -761,12 +799,14 @@ def day_range(start, end):
     return [(d0 + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((d1 - d0).days + 1)]
 
 def profit_view(sales, expenses):
-    """Revenue is net of tax; profit = revenue - cost of goods - expenses."""
     revenue = sum(s.total - s.tax for s in sales)
     cogs = sum(l.get("qty", 0) * l.get("cost", 0) for s in sales for l in json.loads(s.items or "[]"))
     spend = sum(e.amount for e in expenses)
-    return {"revenue": r2(revenue), "tax": r2(sum(s.tax for s in sales)), "cogs": r2(cogs), "gross": r2(revenue - cogs), "expenses": r2(spend),
-            "net": r2(revenue - cogs - spend), "count": len(sales)}
+    return {
+        "revenue": r2(revenue), "tax": r2(sum(s.tax for s in sales)), "cogs": r2(cogs),
+        "gross": r2(revenue - cogs), "expenses": r2(spend), "net": r2(revenue - cogs - spend),
+        "count": len(sales)
+    }
 
 def top_products(sales, n=8):
     agg = defaultdict(lambda: {"qty": 0.0, "revenue": 0.0, "profit": 0.0})
@@ -791,12 +831,16 @@ def dashboard(ws_id: int, today: str = "", user: UserDB = Depends(get_current_us
             per_day[s.date] += s.total - s.tax
     owing = [s for s in live if s.total - s.paid > 0.005]
     low = [prod_out(p) for p in db.query(BizProduct).filter(BizProduct.ws_id == ws_id, BizProduct.active == True).all() if p.stock <= p.low_stock]  # noqa: E712
-    out = {"today": {"revenue": r2(sum(s.total - s.tax for s in today_sales)), "count": len(today_sales)},
-           "month": {"revenue": r2(sum(s.total - s.tax for s in month_sales)), "count": len(month_sales)},
-           "outstanding": {"amount": r2(sum(s.total - s.paid for s in owing)), "count": len(owing), "overdue": sum(1 for s in owing if s.due_date and s.due_date < today)},
-           "low_stock": sorted(low, key=lambda p: p["stock"])[:8], "low_stock_count": len(low),
-           "series": [[d, r2(per_day.get(d, 0))] for d in day_range(since, today)], "top_products": top_products(month_sales, 5),
-           "recent": [sale_out(s, today=today) for s in sorted(live, key=lambda x: x.id, reverse=True)[:6]], "finance": finance}
+    out = {
+        "today": {"revenue": r2(sum(s.total - s.tax for s in today_sales)), "count": len(today_sales)},
+        "month": {"revenue": r2(sum(s.total - s.tax for s in month_sales)), "count": len(month_sales)},
+        "outstanding": {"amount": r2(sum(s.total - s.paid for s in owing)), "count": len(owing), "overdue": sum(1 for s in owing if s.due_date and s.due_date < today)},
+        "low_stock": sorted(low, key=lambda p: p["stock"])[:8], "low_stock_count": len(low),
+        "series": [[d, r2(per_day.get(d, 0))] for d in day_range(since, today)],
+        "top_products": top_products(month_sales, 5),
+        "recent": [sale_out(s, today=today) for s in sorted(live, key=lambda x: x.id, reverse=True)[:6]],
+        "finance": finance
+    }
     if finance:
         exp = db.query(BizExpense).filter(BizExpense.ws_id == ws_id, BizExpense.date >= month).all()
         cat = defaultdict(float)
@@ -829,11 +873,14 @@ def report_summary(ws_id: int, date_from: str = "", date_to: str = "", user: Use
     pays = defaultdict(float)
     for p in db.query(BizPayment).filter(BizPayment.ws_id == ws_id, BizPayment.date >= start, BizPayment.date <= end).all():
         pays[p.method] += p.amount
-    return {"from": start, "to": end, "totals": profit_view(sales, exps),
-            "daily": [[d, r2(v["revenue"]), r2(v["cogs"]), r2(v["expenses"])] for d, v in daily.items()],
-            "expenses_by_category": sorted([[k, r2(v)] for k, v in cat.items()], key=lambda x: -x[1]),
-            "top_products": top_products(sales, 10), "top_customers": sorted([[k, r2(v)] for k, v in cust.items()], key=lambda x: -x[1])[:10],
-            "payments_by_method": sorted([[k, r2(v)] for k, v in pays.items()], key=lambda x: -x[1])}
+    return {
+        "from": start, "to": end, "totals": profit_view(sales, exps),
+        "daily": [[d, r2(v["revenue"]), r2(v["cogs"]), r2(v["expenses"])] for d, v in daily.items()],
+        "expenses_by_category": sorted([[k, r2(v)] for k, v in cat.items()], key=lambda x: -x[1]),
+        "top_products": top_products(sales, 10),
+        "top_customers": sorted([[k, r2(v)] for k, v in cust.items()], key=lambda x: -x[1])[:10],
+        "payments_by_method": sorted([[k, r2(v)] for k, v in pays.items()], key=lambda x: -x[1])
+    }
 
 @router.get("/{ws_id}/reports/receivables")
 def report_receivables(ws_id: int, today: str = "", user: UserDB = Depends(get_current_user), db=Depends(get_db)):
@@ -855,38 +902,181 @@ def report_receivables(ws_id: int, today: str = "", user: UserDB = Depends(get_c
 @router.get("/{ws_id}/reports/inventory")
 def report_inventory(ws_id: int, user: UserDB = Depends(get_current_user), db=Depends(get_db)):
     access(db, ws_id, user, "finance")
-    rows = [{"name": p.name, "sku": p.sku, "category": p.category, "stock": p.stock, "cost": p.cost, "price": p.price, "cost_value": r2(p.stock * p.cost),
-             "retail_value": r2(p.stock * p.price), "low": bool(p.stock <= p.low_stock)}
-            for p in db.query(BizProduct).filter(BizProduct.ws_id == ws_id, BizProduct.active == True).order_by(BizProduct.name).all()]  # noqa: E712
+    rows = [
+        {
+            "name": p.name, "sku": p.sku, "category": p.category, "stock": p.stock,
+            "cost": p.cost, "price": p.price, "cost_value": r2(p.stock * p.cost),
+            "retail_value": r2(p.stock * p.price), "low": bool(p.stock <= p.low_stock)
+        }
+        for p in db.query(BizProduct).filter(BizProduct.ws_id == ws_id, BizProduct.active == True).order_by(BizProduct.name).all()  # noqa: E712
+    ]
     return {"rows": rows, "cost_value": r2(sum(r["cost_value"] for r in rows)), "retail_value": r2(sum(r["retail_value"] for r in rows)), "low_count": sum(1 for r in rows if r["low"])}
 
 # ------------------------------------------------------------------ RMG admin: manage client businesses
-class PlanIn(BaseModel):
+class AdminWorkspacePatch(BaseModel):
     plan: Optional[str] = None
     extend_days: int = 0
+    trial_ends: Optional[str] = None
+    currency: Optional[str] = None
+    tax_rate: Optional[float] = None
+
+class AdminMemberIn(BaseModel):
+    email: str
+    role: str = "Cashier"
+    activate_if_registered: bool = True
+
+class AdminMemberPatch(BaseModel):
+    role: Optional[str] = None
+    status: Optional[str] = None
 
 @router.get("/admin/workspaces")
 def admin_workspaces(admin: UserDB = Depends(require_admin), db=Depends(get_db)):
     out = []
     for w in db.query(BizWorkspace).order_by(BizWorkspace.id.desc()).all():
         o = db.get(UserDB, w.owner_id)
-        out.append({"id": w.id, "name": w.name, "owner": o.email if o else "deleted", "plan": w.plan, "trial_ends": w.trial_ends, "created_at": w.created_at,
-                    "products": db.query(BizProduct).filter(BizProduct.ws_id == w.id).count(), "documents": db.query(BizSale).filter(BizSale.ws_id == w.id).count(),
-                    "members": db.query(BizMember).filter(BizMember.ws_id == w.id).count() + 1})
+        out.append({
+            "id": w.id, "name": w.name, "owner": o.email if o else "deleted",
+            "plan": w.plan, "trial_ends": w.trial_ends, "created_at": w.created_at,
+            "products": db.query(BizProduct).filter(BizProduct.ws_id == w.id).count(),
+            "documents": db.query(BizSale).filter(BizSale.ws_id == w.id).count(),
+            "members": db.query(BizMember).filter(BizMember.ws_id == w.id).count() + 1
+        })
     return out
 
 @router.patch("/admin/workspaces/{ws_id}")
-def admin_workspace_update(ws_id: int, data: PlanIn, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+def admin_workspace_update(ws_id: int, data: AdminWorkspacePatch, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
     w = db.get(BizWorkspace, ws_id)
     if not w:
         raise HTTPException(status_code=404, detail="Business not found")
-    if data.plan:
+    if data.plan is not None:
         if data.plan not in ("trial", "active", "suspended"):
             bad("Plan must be trial, active or suspended.")
         w.plan = data.plan
-    if data.extend_days:
+    if data.trial_ends:
+        parsed_end = ds(data.trial_ends)
+        if not parsed_end:
+            bad("Invalid trial_ends date (use YYYY-MM-DD).")
+        w.trial_ends = parsed_end
+    elif data.extend_days:
         base = max(w.trial_ends or today_utc(), today_utc())
-        w.trial_ends = (datetime.strptime(base, "%Y-%m-%d") + timedelta(days=max(min(data.extend_days, 365), 0))).strftime("%Y-%m-%d")
+        clamped = max(min(data.extend_days, 365), -365)
+        w.trial_ends = (datetime.strptime(base, "%Y-%m-%d") + timedelta(days=clamped)).strftime("%Y-%m-%d")
+    if data.currency is not None:
+        w.currency = (data.currency or "USD").upper()[:3]
+    if data.tax_rate is not None:
+        w.tax_rate = max(0.0, min(float(data.tax_rate), 100.0))
     db.commit()
     audit(db, admin.username, "BIZ_PLAN", f"#{ws_id} plan={w.plan} trial_ends={w.trial_ends}")
-    return {"message": "Updated", "plan": w.plan, "trial_ends": w.trial_ends}
+    return {"message": "Updated", "plan": w.plan, "trial_ends": w.trial_ends, "currency": w.currency, "tax_rate": w.tax_rate}
+
+@router.get("/admin/workspaces/{ws_id}/members")
+def admin_workspace_members(ws_id: int, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+    w = db.get(BizWorkspace, ws_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Business not found")
+    owner = db.get(UserDB, w.owner_id)
+    rows = [{
+        "id": 0,
+        "email": owner.email if owner else "",
+        "name": f"{owner.first_name or ''} {owner.last_name or ''}".strip() or "Owner",
+        "role": "Owner",
+        "status": "Active",
+    }]
+    for m in db.query(BizMember).filter(BizMember.ws_id == ws_id).order_by(BizMember.id).all():
+        u = db.get(UserDB, m.user_id) if m.user_id else None
+        rows.append({
+            "id": m.id,
+            "email": m.email,
+            "name": f"{u.first_name or ''} {u.last_name or ''}".strip() if u else "",
+            "role": m.role,
+            "status": m.status,
+        })
+    return rows
+
+@router.post("/admin/workspaces/{ws_id}/members")
+def admin_workspace_member_add(ws_id: int, data: AdminMemberIn, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+    w = db.get(BizWorkspace, ws_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Business not found")
+    em = clean(data.email, 120).lower()
+    if "@" not in em or "." not in em.split("@")[-1]:
+        bad("Enter a valid email address.")
+    if data.role not in ("Manager", "Cashier", "Accountant"):
+        bad("Role must be Manager, Cashier or Accountant.")
+    owner = db.get(UserDB, w.owner_id)
+    if (owner and owner.email.lower() == em) or db.query(BizMember).filter(BizMember.ws_id == ws_id, func.lower(BizMember.email) == em).first():
+        bad("That person already belongs to this business.")
+
+    existing_user = db.query(UserDB).filter(func.lower(UserDB.email) == em).first()
+    is_active = bool(existing_user and data.activate_if_registered)
+    m = BizMember(
+        ws_id=ws_id,
+        user_id=existing_user.id if is_active else None,
+        email=em,
+        role=data.role,
+        status="Active" if is_active else "Invited",
+        created_at=now_str(),
+    )
+    db.add(m)
+    db.commit()
+    audit(db, admin.username, "ADMIN_BIZ_MEMBER_ADD", f"#{ws_id} {em} ({data.role}, {m.status})")
+    return {"id": m.id, "email": m.email, "role": m.role, "status": m.status}
+
+@router.patch("/admin/workspaces/{ws_id}/members/{member_id}")
+def admin_workspace_member_update(ws_id: int, member_id: int, data: AdminMemberPatch, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+    m = db.get(BizMember, member_id)
+    if not m or m.ws_id != ws_id:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if data.role is not None:
+        if data.role not in ("Manager", "Cashier", "Accountant"):
+            bad("Role must be Manager, Cashier or Accountant.")
+        m.role = data.role
+    if data.status is not None:
+        if data.status not in ("Invited", "Active"):
+            bad("Status must be Invited or Active.")
+        if data.status == "Active" and not m.user_id:
+            u = db.query(UserDB).filter(func.lower(UserDB.email) == (m.email or "").lower()).first()
+            if not u:
+                bad("Cannot activate until a user registers with this email.")
+            m.user_id = u.id
+        m.status = data.status
+    db.commit()
+    audit(db, admin.username, "ADMIN_BIZ_MEMBER_UPDATE", f"#{ws_id} member#{member_id} role={m.role} status={m.status}")
+    return {"message": "Member updated"}
+
+@router.delete("/admin/workspaces/{ws_id}/members/{member_id}")
+def admin_workspace_member_remove(ws_id: int, member_id: int, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+    m = db.get(BizMember, member_id)
+    if not m or m.ws_id != ws_id:
+        raise HTTPException(status_code=404, detail="Member not found")
+    em = m.email
+    db.delete(m)
+    db.commit()
+    audit(db, admin.username, "ADMIN_BIZ_MEMBER_REMOVE", f"#{ws_id} {em}")
+    return {"message": "Member removed"}
+
+@router.get("/admin/workspaces/{ws_id}/ledger")
+def admin_workspace_ledger(ws_id: int, limit: int = 100, admin: UserDB = Depends(require_admin), db=Depends(get_db)):
+    w = db.get(BizWorkspace, ws_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Business not found")
+    cap = max(1, min(limit, 500))
+    sales = db.query(BizSale).filter(BizSale.ws_id == ws_id).order_by(BizSale.id.desc()).limit(cap).all()
+    expenses = db.query(BizExpense).filter(BizExpense.ws_id == ws_id).order_by(BizExpense.date.desc(), BizExpense.id.desc()).limit(cap).all()
+
+    live_sales = [s for s in sales if s.status != "Void"]
+    revenue = r2(sum(s.total - s.tax for s in live_sales))
+    outstanding = r2(sum(max(s.total - s.paid, 0) for s in live_sales))
+    expense_total = r2(sum(e.amount for e in expenses))
+
+    return {
+        "workspace": {"id": w.id, "name": w.name, "currency": w.currency, "plan": w.plan},
+        "summary": {
+            "revenue": revenue,
+            "outstanding": outstanding,
+            "expenses": expense_total,
+            "net_cash_view": r2(revenue - expense_total),
+        },
+        "sales": [sale_out(s) for s in sales],
+        "expenses": [exp_out(e) for e in expenses],
+    }
